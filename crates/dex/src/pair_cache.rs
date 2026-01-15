@@ -14,6 +14,7 @@ use lru::LruCache;
 use sonic_core::utils::now_ms;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use tracing::warn;
 
 #[derive(Debug, Clone)]
 pub struct PairMetadata {
@@ -53,11 +54,20 @@ struct CacheEntry {
     expires_at_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CodeHashEntry {
+    value: Option<B256>,
+    expires_at_ms: u64,
+}
+
+const CODE_HASH_NEGATIVE_TTL_MS: u64 = 30_000;
+const CODE_HASH_POSITIVE_TTL_MS: u64 = 600_000;
+
 pub struct PairMetadataCache {
     positive_ttl_ms: u64,
     negative_ttl_ms: u64,
     entries: LruCache<PairKey, CacheEntry>,
-    pair_code_hashes: HashMap<Address, Option<B256>>,
+    pair_code_hashes: HashMap<Address, CodeHashEntry>,
 }
 
 impl PairMetadataCache {
@@ -70,7 +80,15 @@ impl PairMetadataCache {
         let capacity = NonZeroUsize::new(capacity.max(1)).unwrap();
         let pair_code_hashes = pair_code_hashes
             .into_iter()
-            .map(|(factory, hash)| (factory, Some(hash)))
+            .map(|(factory, hash)| {
+                (
+                    factory,
+                    CodeHashEntry {
+                        value: Some(hash),
+                        expires_at_ms: u64::MAX,
+                    },
+                )
+            })
             .collect();
         Self {
             positive_ttl_ms,
@@ -113,9 +131,22 @@ impl PairMetadataCache {
 
             let pair = match stable {
                 Some(stable) => {
-                    get_pair_address_solidly(provider, factory, token_a, token_b, stable).await?
+                    match get_pair_address_solidly(provider, factory, token_a, token_b, stable).await
+                    {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            warn!(?err, factory = %factory, "getPair failed; falling back to CREATE2");
+                            None
+                        }
+                    }
                 }
-                None => get_pair_address(provider, factory, token_a, token_b).await?,
+                None => match get_pair_address(provider, factory, token_a, token_b).await {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        warn!(?err, factory = %factory, "getPair failed; falling back to CREATE2");
+                        None
+                    }
+                },
             };
             let pair = match pair {
                 Some(pair) => pair,
@@ -177,10 +208,19 @@ impl PairMetadataCache {
             return Ok(None);
         }
 
-        let (token0, token1) = match get_pair_tokens(provider, pair).await? {
-            Some(tokens) => tokens,
-            None => return Ok(None),
+        let (token0, token1) = match get_pair_tokens(provider, pair).await {
+            Ok(Some(tokens)) => tokens,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                warn!(?err, factory = %factory, pair = %pair, "derived pair token query failed");
+                return Ok(None);
+            }
         };
+
+        if !tokens_match(token_a, token_b, token0, token1) {
+            warn!(factory = %factory, pair = %pair, "derived pair tokens mismatch");
+            return Ok(None);
+        }
 
         Ok(Some(PairMetadata {
             factory,
@@ -195,15 +235,27 @@ impl PairMetadataCache {
         provider: &DynProvider,
         factory: Address,
     ) -> Result<Option<B256>> {
+        let now_ms = now_ms();
         if let Some(entry) = self.pair_code_hashes.get(&factory) {
-            return Ok(*entry);
+            if now_ms <= entry.expires_at_ms {
+                return Ok(entry.value);
+            }
         }
 
-        let fetched = match get_pair_code_hash(provider, factory).await {
-            Ok(hash) => hash,
-            Err(_) => None,
+        let fetched = get_pair_code_hash(provider, factory).await?;
+        let entry = if let Some(hash) = fetched {
+            CodeHashEntry {
+                value: Some(hash),
+                expires_at_ms: now_ms.saturating_add(CODE_HASH_POSITIVE_TTL_MS),
+            }
+        } else {
+            warn!(factory = %factory, "pair code hash unavailable; CREATE2 fallback disabled temporarily");
+            CodeHashEntry {
+                value: None,
+                expires_at_ms: now_ms.saturating_add(CODE_HASH_NEGATIVE_TTL_MS),
+            }
         };
-        self.pair_code_hashes.insert(factory, fetched);
+        self.pair_code_hashes.insert(factory, entry);
         Ok(fetched)
     }
 
@@ -231,6 +283,20 @@ impl PairMetadataCache {
                 expires_at_ms,
             },
         );
+    }
+}
+
+fn tokens_match(token_a: Address, token_b: Address, token0: Address, token1: Address) -> bool {
+    let (want0, want1) = sort_tokens(token_a, token_b);
+    let (have0, have1) = sort_tokens(token0, token1);
+    want0 == have0 && want1 == have1
+}
+
+fn sort_tokens(token_a: Address, token_b: Address) -> (Address, Address) {
+    if token_a < token_b {
+        (token_a, token_b)
+    } else {
+        (token_b, token_a)
     }
 }
 
@@ -344,5 +410,27 @@ mod tests {
 
         let cached = cache.get_cached(PairKey::new(factory, token_a, token_b, Some(false)), 1_000);
         assert!(cached.is_none());
+    }
+
+    #[test]
+    fn tokens_match_accepts_sorted_and_unsorted() {
+        let token_a = address!("0x00000000000000000000000000000000000000aa");
+        let token_b = address!("0x00000000000000000000000000000000000000bb");
+        let token0 = address!("0x00000000000000000000000000000000000000aa");
+        let token1 = address!("0x00000000000000000000000000000000000000bb");
+
+        assert!(tokens_match(token_a, token_b, token0, token1));
+        assert!(tokens_match(token_b, token_a, token0, token1));
+        assert!(tokens_match(token_a, token_b, token1, token0));
+    }
+
+    #[test]
+    fn tokens_match_rejects_mismatch() {
+        let token_a = address!("0x00000000000000000000000000000000000000aa");
+        let token_b = address!("0x00000000000000000000000000000000000000bb");
+        let token0 = address!("0x00000000000000000000000000000000000000aa");
+        let token1 = address!("0x00000000000000000000000000000000000000cc");
+
+        assert!(!tokens_match(token_a, token_b, token0, token1));
     }
 }
