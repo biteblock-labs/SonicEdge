@@ -1,0 +1,12 @@
+[package]
+name = "sonic-executor"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy.workspace = true
+anyhow.workspace = true
+sonic-core = { path = "../core" }
+tracing.workspace = true

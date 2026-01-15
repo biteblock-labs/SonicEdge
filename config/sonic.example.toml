@@ -1,0 +1,52 @@
+[chain]
+chain_id = 146
+rpc_http = "https://sonic-mainnet.g.alchemy.com/v2/4xPzaB2HGbmoKgxaarP9dFcVHa9tKMtZ"
+rpc_ws   = "wss://sonic-mainnet.g.alchemy.com/v2/4xPzaB2HGbmoKgxaarP9dFcVHa9tKMtZ"
+
+[mempool]
+mode = "ws+txpool"
+txpool_poll_ms = 500
+fetch_concurrency = 256
+tx_fetch_timeout_ms = 150
+dedup_capacity = 100000
+dedup_ttl_ms = 60000
+ws_reconnect_base_ms = 500
+ws_reconnect_max_ms = 30000
+
+[dex]
+routers = ["0x0000000000000000000000000000000000000000"]
+factories = ["0x0000000000000000000000000000000000000000"]
+router_factories = []
+factory_pair_code_hashes = []
+base_tokens = ["0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000001"]
+pair_cache_capacity = 2048
+pair_cache_ttl_ms = 300000
+pair_cache_negative_ttl_ms = 15000
+allow_execution_without_pair = false
+min_base_amount = "1000"
+max_slippage_bps = 300
+deadline_secs = 20
+
+[risk]
+sellability_amount_base = "10"
+max_tax_bps = 1500
+erc20_call_timeout_ms = 120
+
+[executor]
+owner_private_key_env = "SNIPER_PK"
+executor_contract = "0x0000000000000000000000000000000000000000"
+gas_mode = "eip1559"
+max_fee_gwei = 200
+max_priority_gwei = 50
+bump_pct = 15
+bump_interval_ms = 800
+
+[strategy]
+take_profit_bps = 3000
+stop_loss_bps = 1500
+max_hold_secs = 900
+
+[observability]
+metrics_enabled = true
+metrics_bind = "0.0.0.0:9102"
+log_level = "info"

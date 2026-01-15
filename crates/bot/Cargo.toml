@@ -1,0 +1,18 @@
+[package]
+name = "sonic-bot"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy.workspace = true
+anyhow.workspace = true
+prometheus.workspace = true
+sonic-chain = { path = "../chain" }
+sonic-core = { path = "../core", features = ["metrics"] }
+sonic-dex = { path = "../dex" }
+sonic-executor = { path = "../executor" }
+sonic-risk = { path = "../risk" }
+tokio.workspace = true
+tracing.workspace = true

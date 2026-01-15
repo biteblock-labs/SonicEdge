@@ -1,0 +1,19 @@
+[package]
+name = "sonic-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy.workspace = true
+anyhow.workspace = true
+config.workspace = true
+lru.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+prometheus = { workspace = true, optional = true }
+
+[features]
+metrics = ["dep:prometheus"]
