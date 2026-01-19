@@ -7,6 +7,7 @@ pub use decoder::{
     decode_router_calldata,
     RouterCall,
     SolidlyAddLiquidity,
+    SolidlyAddLiquidityEth,
     V2AddLiquidity,
     V2AddLiquidityEth,
 };

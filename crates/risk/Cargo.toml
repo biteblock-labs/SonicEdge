@@ -9,4 +9,5 @@ license.workspace = true
 alloy.workspace = true
 anyhow.workspace = true
 sonic-core = { path = "../core" }
+tokio.workspace = true
 tracing.workspace = true

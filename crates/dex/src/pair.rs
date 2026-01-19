@@ -5,6 +5,7 @@ use crate::abi::{
     IUniswapV2Factory,
     IUniswapV2Pair,
 };
+use alloy::eips::BlockId;
 use alloy::primitives::{keccak256, Address, B256, TxKind, U256};
 use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::transaction::TransactionInput;
@@ -75,6 +76,18 @@ pub async fn contract_exists(provider: &DynProvider, address: Address) -> Result
     Ok(!code.is_empty())
 }
 
+pub async fn contract_exists_at_block(
+    provider: &DynProvider,
+    address: Address,
+    block_number: u64,
+) -> Result<bool> {
+    let code = provider
+        .get_code_at(address)
+        .block_id(BlockId::number(block_number))
+        .await?;
+    Ok(!code.is_empty())
+}
+
 pub fn derive_pair_address_v2(
     factory: Address,
     token_a: Address,
@@ -113,6 +126,25 @@ pub async fn get_reserves(provider: &DynProvider, pair: Address) -> Result<Optio
         ..Default::default()
     };
     let data = provider.call(tx).await?;
+    let ret = IUniswapV2Pair::getReservesCall::abi_decode_returns(&data)?;
+    Ok(Some((U256::from(ret.reserve0), U256::from(ret.reserve1))))
+}
+
+pub async fn get_reserves_at_block(
+    provider: &DynProvider,
+    pair: Address,
+    block_number: u64,
+) -> Result<Option<(U256, U256)>> {
+    let call = IUniswapV2Pair::getReservesCall {};
+    let tx = TransactionRequest {
+        to: Some(TxKind::Call(pair)),
+        input: TransactionInput::new(call.abi_encode().into()),
+        ..Default::default()
+    };
+    let data = provider
+        .call(tx)
+        .block(BlockId::number(block_number))
+        .await?;
     let ret = IUniswapV2Pair::getReservesCall::abi_decode_returns(&data)?;
     Ok(Some((U256::from(ret.reserve0), U256::from(ret.reserve1))))
 }

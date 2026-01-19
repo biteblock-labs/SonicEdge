@@ -1,3 +1,4 @@
+
 use crate::pair::{
     contract_exists,
     derive_pair_address_solidly,
@@ -163,9 +164,14 @@ impl PairMetadataCache {
                 }
             };
 
-            let (token0, token1) = match get_pair_tokens(provider, pair).await? {
-                Some(tokens) => tokens,
-                None => {
+            let (token0, token1) = match get_pair_tokens(provider, pair).await {
+                Ok(Some(tokens)) => tokens,
+                Ok(None) => {
+                    self.insert_cached(key, None, now_ms);
+                    continue;
+                }
+                Err(err) => {
+                    warn!(?err, factory = %factory, pair = %pair, "pair token query failed");
                     self.insert_cached(key, None, now_ms);
                     continue;
                 }
@@ -182,6 +188,27 @@ impl PairMetadataCache {
         }
 
         Ok(None)
+    }
+
+    pub async fn predict_pair_address(
+        &mut self,
+        provider: &DynProvider,
+        factory: Address,
+        token_a: Address,
+        token_b: Address,
+        stable: Option<bool>,
+    ) -> Result<Option<Address>> {
+        let init_code_hash = match self.code_hash_for_factory(provider, factory).await? {
+            Some(hash) => hash,
+            None => return Ok(None),
+        };
+        let pair = match stable {
+            Some(stable) => {
+                derive_pair_address_solidly(factory, token_a, token_b, stable, init_code_hash)
+            }
+            None => derive_pair_address_v2(factory, token_a, token_b, init_code_hash),
+        };
+        Ok(Some(pair))
     }
 
     async fn resolve_with_create2(
@@ -236,17 +263,60 @@ impl PairMetadataCache {
         factory: Address,
     ) -> Result<Option<B256>> {
         let now_ms = now_ms();
-        if let Some(entry) = self.pair_code_hashes.get(&factory) {
+        let existing = self.pair_code_hashes.get(&factory).cloned();
+        if let Some(entry) = &existing {
             if now_ms <= entry.expires_at_ms {
                 return Ok(entry.value);
             }
         }
 
-        let fetched = get_pair_code_hash(provider, factory).await?;
+        let fetched = match get_pair_code_hash(provider, factory).await {
+            Ok(hash) => hash,
+            Err(err) => {
+                warn!(?err, factory = %factory, "pair code hash lookup failed; using cached value if available");
+                if let Some(entry) = existing {
+                    let refreshed = if entry.value.is_some() {
+                        CodeHashEntry {
+                            value: entry.value,
+                            expires_at_ms: now_ms.saturating_add(CODE_HASH_POSITIVE_TTL_MS),
+                        }
+                    } else {
+                        CodeHashEntry {
+                            value: None,
+                            expires_at_ms: now_ms.saturating_add(CODE_HASH_NEGATIVE_TTL_MS),
+                        }
+                    };
+                    self.pair_code_hashes.insert(factory, refreshed);
+                    return Ok(entry.value);
+                }
+                self.pair_code_hashes.insert(
+                    factory,
+                    CodeHashEntry {
+                        value: None,
+                        expires_at_ms: now_ms.saturating_add(CODE_HASH_NEGATIVE_TTL_MS),
+                    },
+                );
+                return Ok(None);
+            }
+        };
+
         let entry = if let Some(hash) = fetched {
             CodeHashEntry {
                 value: Some(hash),
                 expires_at_ms: now_ms.saturating_add(CODE_HASH_POSITIVE_TTL_MS),
+            }
+        } else if let Some(existing) = existing {
+            warn!(factory = %factory, "pair code hash unavailable; keeping last known value");
+            if existing.value.is_some() {
+                CodeHashEntry {
+                    value: existing.value,
+                    expires_at_ms: now_ms.saturating_add(CODE_HASH_POSITIVE_TTL_MS),
+                }
+            } else {
+                CodeHashEntry {
+                    value: None,
+                    expires_at_ms: now_ms.saturating_add(CODE_HASH_NEGATIVE_TTL_MS),
+                }
             }
         } else {
             warn!(factory = %factory, "pair code hash unavailable; CREATE2 fallback disabled temporarily");
@@ -255,8 +325,9 @@ impl PairMetadataCache {
                 expires_at_ms: now_ms.saturating_add(CODE_HASH_NEGATIVE_TTL_MS),
             }
         };
+        let value = entry.value;
         self.pair_code_hashes.insert(factory, entry);
-        Ok(fetched)
+        Ok(value)
     }
 
     fn get_cached(&mut self, key: PairKey, now_ms: u64) -> Option<Option<PairMetadata>> {
@@ -303,7 +374,9 @@ fn sort_tokens(token_a: Address, token_b: Address) -> (Address, Address) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::address;
+    use alloy::primitives::{address, b256};
+    use alloy::providers::{Provider, ProviderBuilder};
+    use alloy::transports::mock::Asserter;
     use std::collections::HashMap;
 
     #[test]
@@ -432,5 +505,27 @@ mod tests {
         let token1 = address!("0x00000000000000000000000000000000000000cc");
 
         assert!(!tokens_match(token_a, token_b, token0, token1));
+    }
+
+    #[tokio::test]
+    async fn predict_pair_address_uses_cached_code_hash() {
+        let factory = address!("0x0000000000000000000000000000000000000001");
+        let token_a = address!("0x00000000000000000000000000000000000000aa");
+        let token_b = address!("0x00000000000000000000000000000000000000bb");
+        let init_code_hash =
+            b256!("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let mut cache = PairMetadataCache::new(2, 1000, 100, HashMap::from([(factory, init_code_hash)]));
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(Asserter::new())
+            .erased();
+
+        let predicted = cache
+            .predict_pair_address(&provider, factory, token_a, token_b, None)
+            .await
+            .unwrap()
+            .expect("pair predicted");
+        let expected = derive_pair_address_v2(factory, token_a, token_b, init_code_hash);
+
+        assert_eq!(predicted, expected);
     }
 }

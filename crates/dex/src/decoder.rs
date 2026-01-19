@@ -37,10 +37,22 @@ pub struct SolidlyAddLiquidity {
 }
 
 #[derive(Debug, Clone)]
+pub struct SolidlyAddLiquidityEth {
+    pub token: Address,
+    pub stable: bool,
+    pub amount_token_desired: U256,
+    pub amount_token_min: U256,
+    pub amount_eth_min: U256,
+    pub to: Address,
+    pub deadline: U256,
+}
+
+#[derive(Debug, Clone)]
 pub enum RouterCall {
     AddLiquidity(V2AddLiquidity),
     AddLiquidityEth(V2AddLiquidityEth),
     AddLiquiditySolidly(SolidlyAddLiquidity),
+    AddLiquidityEthSolidly(SolidlyAddLiquidityEth),
 }
 
 pub fn decode_router_calldata(input: &[u8]) -> Result<Option<RouterCall>> {
@@ -62,6 +74,11 @@ pub fn decode_router_calldata(input: &[u8]) -> Result<Option<RouterCall>> {
     if selector == ISolidlyRouter::addLiquidityCall::SELECTOR {
         let call = ISolidlyRouter::addLiquidityCall::abi_decode(input)?;
         return Ok(Some(RouterCall::AddLiquiditySolidly(call.into())));
+    }
+
+    if selector == ISolidlyRouter::addLiquidityETHCall::SELECTOR {
+        let call = ISolidlyRouter::addLiquidityETHCall::abi_decode(input)?;
+        return Ok(Some(RouterCall::AddLiquidityEthSolidly(call.into())));
     }
 
     Ok(None)
@@ -103,6 +120,20 @@ impl From<ISolidlyRouter::addLiquidityCall> for SolidlyAddLiquidity {
             amount_b_desired: call.amountBDesired,
             amount_a_min: call.amountAMin,
             amount_b_min: call.amountBMin,
+            to: call.to,
+            deadline: call.deadline,
+        }
+    }
+}
+
+impl From<ISolidlyRouter::addLiquidityETHCall> for SolidlyAddLiquidityEth {
+    fn from(call: ISolidlyRouter::addLiquidityETHCall) -> Self {
+        Self {
+            token: call.token,
+            stable: call.stable,
+            amount_token_desired: call.amountTokenDesired,
+            amount_token_min: call.amountTokenMin,
+            amount_eth_min: call.amountETHMin,
             to: call.to,
             deadline: call.deadline,
         }
@@ -167,6 +198,34 @@ mod tests {
                 assert_eq!(add.amount_b_desired, call.amountBDesired);
                 assert_eq!(add.amount_a_min, call.amountAMin);
                 assert_eq!(add.amount_b_min, call.amountBMin);
+                assert_eq!(add.to, call.to);
+                assert_eq!(add.deadline, call.deadline);
+            }
+            _ => panic!("unexpected decode"),
+        }
+    }
+
+    #[test]
+    fn decode_solidly_add_liquidity_eth() {
+        let call = ISolidlyRouter::addLiquidityETHCall {
+            token: address!("0x1000000000000000000000000000000000000001"),
+            stable: false,
+            amountTokenDesired: U256::from(1_000u64),
+            amountTokenMin: U256::from(900u64),
+            amountETHMin: U256::from(2_000u64),
+            to: address!("0x3000000000000000000000000000000000000003"),
+            deadline: U256::from(123u64),
+        };
+
+        let data = call.abi_encode();
+        let decoded = decode_router_calldata(&data).unwrap();
+        match decoded {
+            Some(RouterCall::AddLiquidityEthSolidly(add)) => {
+                assert_eq!(add.token, call.token);
+                assert_eq!(add.stable, call.stable);
+                assert_eq!(add.amount_token_desired, call.amountTokenDesired);
+                assert_eq!(add.amount_token_min, call.amountTokenMin);
+                assert_eq!(add.amount_eth_min, call.amountETHMin);
                 assert_eq!(add.to, call.to);
                 assert_eq!(add.deadline, call.deadline);
             }

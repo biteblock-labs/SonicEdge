@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 alloy.workspace = true
 anyhow.workspace = true
+lru.workspace = true
 prometheus.workspace = true
 sonic-chain = { path = "../chain" }
 sonic-core = { path = "../core", features = ["metrics"] }

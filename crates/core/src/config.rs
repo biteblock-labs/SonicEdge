@@ -47,6 +47,8 @@ pub struct DexConfig {
     #[serde(default)]
     pub factory_pair_code_hashes: Vec<FactoryPairCodeHashConfig>,
     #[serde(default)]
+    pub wrapped_native: Option<String>,
+    #[serde(default)]
     pub base_tokens: Vec<String>,
     #[serde(default = "default_pair_cache_capacity")]
     pub pair_cache_capacity: usize,
@@ -56,6 +58,10 @@ pub struct DexConfig {
     pub pair_cache_negative_ttl_ms: u64,
     #[serde(default)]
     pub allow_execution_without_pair: bool,
+    #[serde(default)]
+    pub launch_only_liquidity_gate: bool,
+    #[serde(default = "default_launch_only_liquidity_gate_mode")]
+    pub launch_only_liquidity_gate_mode: String,
     pub min_base_amount: String,
     pub max_slippage_bps: u32,
     pub deadline_secs: u64,
@@ -66,6 +72,10 @@ pub struct RiskConfig {
     pub sellability_amount_base: String,
     pub max_tax_bps: u32,
     pub erc20_call_timeout_ms: u64,
+    #[serde(default = "default_sell_simulation_mode")]
+    pub sell_simulation_mode: String,
+    #[serde(default = "default_sell_simulation_override_mode")]
+    pub sell_simulation_override_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +87,14 @@ pub struct ExecutorConfig {
     pub max_priority_gwei: u64,
     pub bump_pct: u32,
     pub bump_interval_ms: u64,
+    #[serde(default = "default_nonce_sync_interval_ms")]
+    pub nonce_sync_interval_ms: u64,
+    #[serde(default = "default_receipt_poll_interval_ms")]
+    pub receipt_poll_interval_ms: u64,
+    #[serde(default = "default_receipt_timeout_ms")]
+    pub receipt_timeout_ms: u64,
+    #[serde(default = "default_max_block_number_delta")]
+    pub max_block_number_delta: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +102,10 @@ pub struct StrategyConfig {
     pub take_profit_bps: u32,
     pub stop_loss_bps: u32,
     pub max_hold_secs: u64,
+    #[serde(default = "default_candidate_cache_capacity")]
+    pub candidate_cache_capacity: usize,
+    #[serde(default = "default_candidate_ttl_ms")]
+    pub candidate_ttl_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +134,18 @@ fn default_pair_cache_capacity() -> usize {
     2048
 }
 
+fn default_sell_simulation_mode() -> String {
+    "best_effort".to_string()
+}
+
+fn default_sell_simulation_override_mode() -> String {
+    "detect".to_string()
+}
+
+fn default_launch_only_liquidity_gate_mode() -> String {
+    "strict".to_string()
+}
+
 fn default_pair_cache_ttl_ms() -> u64 {
     300_000
 }
@@ -138,6 +172,30 @@ fn default_ws_reconnect_max_ms() -> u64 {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_candidate_cache_capacity() -> usize {
+    10_000
+}
+
+fn default_candidate_ttl_ms() -> u64 {
+    300_000
+}
+
+fn default_nonce_sync_interval_ms() -> u64 {
+    10_000
+}
+
+fn default_receipt_poll_interval_ms() -> u64 {
+    2_000
+}
+
+fn default_receipt_timeout_ms() -> u64 {
+    120_000
+}
+
+fn default_max_block_number_delta() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

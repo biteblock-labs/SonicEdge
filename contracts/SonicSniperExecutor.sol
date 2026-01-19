@@ -48,6 +48,20 @@ interface IUniswapV2Router02 {
         address to,
         uint256 deadline
     ) external;
+
+    function swapExactETHForTokens(
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external payable returns (uint256[] memory amounts);
+
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external payable;
 }
 
 interface ISolidlyRouter {
@@ -64,6 +78,13 @@ interface ISolidlyRouter {
         address to,
         uint256 deadline
     ) external returns (uint256[] memory amounts);
+
+    function swapExactETHForTokens(
+        uint256 amountOutMin,
+        Route[] calldata routes,
+        address to,
+        uint256 deadline
+    ) external payable returns (uint256[] memory amounts);
 }
 
 interface IUniswapV2Pair {
@@ -160,6 +181,51 @@ contract SonicSniperExecutor {
         emit Bought(router, path[0], path[path.length - 1], amountIn, minAmountOut, to, block.number);
     }
 
+    function buyV2ETH(
+        address router,
+        address[] calldata path,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address recipient,
+        uint256 deadline,
+        address pair,
+        uint112 minBaseReserve,
+        uint112 minTokenReserve,
+        uint64 maxBlockNumber
+    ) external payable onlyOwner returns (uint256 amountOut) {
+        require(path.length >= 2, "BAD_PATH");
+        require(msg.value == amountIn, "BAD_VALUE");
+
+        if (maxBlockNumber != 0) {
+            require(block.number <= maxBlockNumber, "BLOCK_GUARD");
+        }
+
+        if (pair != address(0)) {
+            (uint112 r0, uint112 r1,) = IUniswapV2Pair(pair).getReserves();
+            require(r0 >= minBaseReserve && r1 >= minTokenReserve, "RESERVE_GUARD");
+        }
+
+        address to = recipient == address(0) ? owner : recipient;
+
+        if (useFeeOnTransfer) {
+            uint256 beforeBal = IERC20(path[path.length - 1]).balanceOf(to);
+            IUniswapV2Router02(router).swapExactETHForTokensSupportingFeeOnTransferTokens{value: amountIn}(
+                minAmountOut,
+                path,
+                to,
+                deadline
+            );
+            uint256 afterBal = IERC20(path[path.length - 1]).balanceOf(to);
+            amountOut = afterBal - beforeBal;
+        } else {
+            uint256[] memory amounts =
+                IUniswapV2Router02(router).swapExactETHForTokens{value: amountIn}(minAmountOut, path, to, deadline);
+            amountOut = amounts[amounts.length - 1];
+        }
+
+        emit Bought(router, address(0), path[path.length - 1], amountIn, minAmountOut, to, block.number);
+    }
+
     function buySolidly(
         address router,
         address tokenIn,
@@ -204,6 +270,43 @@ contract SonicSniperExecutor {
         tokenInErc20.safeApprove(router, 0);
 
         emit Bought(router, tokenIn, tokenOut, amountIn, minAmountOut, to, block.number);
+    }
+
+    function buySolidlyETH(
+        address router,
+        address tokenIn,
+        address tokenOut,
+        bool stable,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address recipient,
+        uint256 deadline,
+        address pair,
+        uint112 minBaseReserve,
+        uint112 minTokenReserve,
+        uint64 maxBlockNumber
+    ) external payable onlyOwner returns (uint256 amountOut) {
+        require(msg.value == amountIn, "BAD_VALUE");
+
+        if (maxBlockNumber != 0) {
+            require(block.number <= maxBlockNumber, "BLOCK_GUARD");
+        }
+
+        if (pair != address(0)) {
+            (uint112 r0, uint112 r1,) = IUniswapV2Pair(pair).getReserves();
+            require(r0 >= minBaseReserve && r1 >= minTokenReserve, "RESERVE_GUARD");
+        }
+
+        address to = recipient == address(0) ? owner : recipient;
+
+        ISolidlyRouter.Route[] memory routes = new ISolidlyRouter.Route[](1);
+        routes[0] = ISolidlyRouter.Route({from: tokenIn, to: tokenOut, stable: stable});
+
+        uint256[] memory amounts =
+            ISolidlyRouter(router).swapExactETHForTokens{value: amountIn}(minAmountOut, routes, to, deadline);
+        amountOut = amounts[amounts.length - 1];
+
+        emit Bought(router, address(0), tokenOut, amountIn, minAmountOut, to, block.number);
     }
 
     function rescueToken(address token, address to, uint256 amount) external onlyOwner {

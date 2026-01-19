@@ -37,6 +37,36 @@ pub struct BuySolidlyParams {
     pub max_block_number: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct BuyV2EthParams {
+    pub router: Address,
+    pub path: Vec<Address>,
+    pub amount_in: U256,
+    pub min_amount_out: U256,
+    pub recipient: Address,
+    pub deadline: U256,
+    pub pair: Address,
+    pub min_base_reserve: u128,
+    pub min_token_reserve: u128,
+    pub max_block_number: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuySolidlyEthParams {
+    pub router: Address,
+    pub token_in: Address,
+    pub token_out: Address,
+    pub stable: bool,
+    pub amount_in: U256,
+    pub min_amount_out: U256,
+    pub recipient: Address,
+    pub deadline: U256,
+    pub pair: Address,
+    pub min_base_reserve: u128,
+    pub min_token_reserve: u128,
+    pub max_block_number: u64,
+}
+
 #[derive(Clone)]
 pub struct ExecutorTxBuilder {
     pub contract: Address,
@@ -81,6 +111,33 @@ impl ExecutorTxBuilder {
         tx
     }
 
+    pub fn build_buy_v2_eth(&self, params: BuyV2EthParams, nonce: u64) -> TransactionRequest {
+        let call = SonicSniperExecutor::buyV2ETHCall {
+            router: params.router,
+            path: params.path,
+            amountIn: params.amount_in,
+            minAmountOut: params.min_amount_out,
+            recipient: params.recipient,
+            deadline: params.deadline,
+            pair: params.pair,
+            minBaseReserve: U112::from(params.min_base_reserve),
+            minTokenReserve: U112::from(params.min_token_reserve),
+            maxBlockNumber: params.max_block_number,
+        };
+
+        let mut tx = TransactionRequest {
+            from: Some(self.owner),
+            to: Some(TxKind::Call(self.contract)),
+            input: TransactionInput::new(call.abi_encode().into()),
+            value: Some(params.amount_in),
+            nonce: Some(nonce),
+            chain_id: Some(self.chain_id),
+            ..Default::default()
+        };
+        self.fees.apply(&mut tx);
+        tx
+    }
+
     pub fn build_buy_solidly(
         &self,
         params: BuySolidlyParams,
@@ -113,6 +170,39 @@ impl ExecutorTxBuilder {
         tx
     }
 
+    pub fn build_buy_solidly_eth(
+        &self,
+        params: BuySolidlyEthParams,
+        nonce: u64,
+    ) -> TransactionRequest {
+        let call = SonicSniperExecutor::buySolidlyETHCall {
+            router: params.router,
+            tokenIn: params.token_in,
+            tokenOut: params.token_out,
+            stable: params.stable,
+            amountIn: params.amount_in,
+            minAmountOut: params.min_amount_out,
+            recipient: params.recipient,
+            deadline: params.deadline,
+            pair: params.pair,
+            minBaseReserve: U112::from(params.min_base_reserve),
+            minTokenReserve: U112::from(params.min_token_reserve),
+            maxBlockNumber: params.max_block_number,
+        };
+
+        let mut tx = TransactionRequest {
+            from: Some(self.owner),
+            to: Some(TxKind::Call(self.contract)),
+            input: TransactionInput::new(call.abi_encode().into()),
+            value: Some(params.amount_in),
+            nonce: Some(nonce),
+            chain_id: Some(self.chain_id),
+            ..Default::default()
+        };
+        self.fees.apply(&mut tx);
+        tx
+    }
+
     pub fn encode_buy_v2(params: BuyV2Params) -> Vec<u8> {
         let call = SonicSniperExecutor::buyV2Call {
             router: params.router,
@@ -129,8 +219,42 @@ impl ExecutorTxBuilder {
         call.abi_encode()
     }
 
+    pub fn encode_buy_v2_eth(params: BuyV2EthParams) -> Vec<u8> {
+        let call = SonicSniperExecutor::buyV2ETHCall {
+            router: params.router,
+            path: params.path,
+            amountIn: params.amount_in,
+            minAmountOut: params.min_amount_out,
+            recipient: params.recipient,
+            deadline: params.deadline,
+            pair: params.pair,
+            minBaseReserve: U112::from(params.min_base_reserve),
+            minTokenReserve: U112::from(params.min_token_reserve),
+            maxBlockNumber: params.max_block_number,
+        };
+        call.abi_encode()
+    }
+
     pub fn encode_buy_solidly(params: BuySolidlyParams) -> Vec<u8> {
         let call = SonicSniperExecutor::buySolidlyCall {
+            router: params.router,
+            tokenIn: params.token_in,
+            tokenOut: params.token_out,
+            stable: params.stable,
+            amountIn: params.amount_in,
+            minAmountOut: params.min_amount_out,
+            recipient: params.recipient,
+            deadline: params.deadline,
+            pair: params.pair,
+            minBaseReserve: U112::from(params.min_base_reserve),
+            minTokenReserve: U112::from(params.min_token_reserve),
+            maxBlockNumber: params.max_block_number,
+        };
+        call.abi_encode()
+    }
+
+    pub fn encode_buy_solidly_eth(params: BuySolidlyEthParams) -> Vec<u8> {
+        let call = SonicSniperExecutor::buySolidlyETHCall {
             router: params.router,
             tokenIn: params.token_in,
             tokenOut: params.token_out,
@@ -227,6 +351,109 @@ mod tests {
         );
 
         let decoded = SonicSniperExecutor::buySolidlyCall::abi_decode(&data).unwrap();
+        assert_eq!(
+            decoded.router,
+            address!("0x1111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            decoded.tokenIn,
+            address!("0x2222222222222222222222222222222222222222")
+        );
+        assert_eq!(
+            decoded.tokenOut,
+            address!("0x3333333333333333333333333333333333333333")
+        );
+        assert!(decoded.stable);
+        assert_eq!(decoded.amountIn, U256::from(10_000u64));
+        assert_eq!(decoded.minAmountOut, U256::from(9_500u64));
+        assert_eq!(
+            decoded.recipient,
+            address!("0x4444444444444444444444444444444444444444")
+        );
+        assert_eq!(decoded.deadline, U256::from(999u64));
+        assert_eq!(
+            decoded.pair,
+            address!("0x5555555555555555555555555555555555555555")
+        );
+        assert_eq!(decoded.minBaseReserve, U112::from(1000u128));
+        assert_eq!(decoded.minTokenReserve, U112::from(2000u128));
+        assert_eq!(decoded.maxBlockNumber, 12_345u64);
+    }
+
+    #[test]
+    fn encode_buy_v2_eth_selector_and_args() {
+        let params = BuyV2EthParams {
+            router: address!("0x1111111111111111111111111111111111111111"),
+            path: vec![
+                address!("0x2222222222222222222222222222222222222222"),
+                address!("0x3333333333333333333333333333333333333333"),
+            ],
+            amount_in: U256::from(10_000u64),
+            min_amount_out: U256::from(9_500u64),
+            recipient: address!("0x4444444444444444444444444444444444444444"),
+            deadline: U256::from(999u64),
+            pair: address!("0x5555555555555555555555555555555555555555"),
+            min_base_reserve: 1000u128,
+            min_token_reserve: 2000u128,
+            max_block_number: 12_345,
+        };
+
+        let data = ExecutorTxBuilder::encode_buy_v2_eth(params);
+        assert_eq!(&data[0..4], &SonicSniperExecutor::buyV2ETHCall::SELECTOR);
+
+        let decoded = SonicSniperExecutor::buyV2ETHCall::abi_decode(&data).unwrap();
+        assert_eq!(
+            decoded.router,
+            address!("0x1111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            decoded.path[0],
+            address!("0x2222222222222222222222222222222222222222")
+        );
+        assert_eq!(
+            decoded.path[1],
+            address!("0x3333333333333333333333333333333333333333")
+        );
+        assert_eq!(decoded.amountIn, U256::from(10_000u64));
+        assert_eq!(decoded.minAmountOut, U256::from(9_500u64));
+        assert_eq!(
+            decoded.recipient,
+            address!("0x4444444444444444444444444444444444444444")
+        );
+        assert_eq!(decoded.deadline, U256::from(999u64));
+        assert_eq!(
+            decoded.pair,
+            address!("0x5555555555555555555555555555555555555555")
+        );
+        assert_eq!(decoded.minBaseReserve, U112::from(1000u128));
+        assert_eq!(decoded.minTokenReserve, U112::from(2000u128));
+        assert_eq!(decoded.maxBlockNumber, 12_345u64);
+    }
+
+    #[test]
+    fn encode_buy_solidly_eth_selector_and_args() {
+        let params = BuySolidlyEthParams {
+            router: address!("0x1111111111111111111111111111111111111111"),
+            token_in: address!("0x2222222222222222222222222222222222222222"),
+            token_out: address!("0x3333333333333333333333333333333333333333"),
+            stable: true,
+            amount_in: U256::from(10_000u64),
+            min_amount_out: U256::from(9_500u64),
+            recipient: address!("0x4444444444444444444444444444444444444444"),
+            deadline: U256::from(999u64),
+            pair: address!("0x5555555555555555555555555555555555555555"),
+            min_base_reserve: 1000u128,
+            min_token_reserve: 2000u128,
+            max_block_number: 12_345,
+        };
+
+        let data = ExecutorTxBuilder::encode_buy_solidly_eth(params);
+        assert_eq!(
+            &data[0..4],
+            &SonicSniperExecutor::buySolidlyETHCall::SELECTOR
+        );
+
+        let decoded = SonicSniperExecutor::buySolidlyETHCall::abi_decode(&data).unwrap();
         assert_eq!(
             decoded.router,
             address!("0x1111111111111111111111111111111111111111")

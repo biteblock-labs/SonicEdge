@@ -18,11 +18,14 @@ routers = ["0x0000000000000000000000000000000000000000"]
 factories = ["0x0000000000000000000000000000000000000000"]
 router_factories = []
 factory_pair_code_hashes = []
+wrapped_native = "0x0000000000000000000000000000000000000000"
 base_tokens = ["0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000001"]
 pair_cache_capacity = 2048
 pair_cache_ttl_ms = 300000
 pair_cache_negative_ttl_ms = 15000
 allow_execution_without_pair = false
+launch_only_liquidity_gate = true
+launch_only_liquidity_gate_mode = "strict"
 min_base_amount = "1000"
 max_slippage_bps = 300
 deadline_secs = 20
@@ -31,6 +34,8 @@ deadline_secs = 20
 sellability_amount_base = "10"
 max_tax_bps = 1500
 erc20_call_timeout_ms = 120
+sell_simulation_mode = "best_effort"
+sell_simulation_override_mode = "detect"
 
 [executor]
 owner_private_key_env = "SNIPER_PK"
@@ -40,11 +45,17 @@ max_fee_gwei = 200
 max_priority_gwei = 50
 bump_pct = 15
 bump_interval_ms = 800
+nonce_sync_interval_ms = 10000
+receipt_poll_interval_ms = 2000
+receipt_timeout_ms = 120000
+max_block_number_delta = 1
 
 [strategy]
 take_profit_bps = 3000
 stop_loss_bps = 1500
 max_hold_secs = 900
+candidate_cache_capacity = 10000
+candidate_ttl_ms = 300000
 
 [observability]
 metrics_enabled = true

@@ -29,14 +29,17 @@ Developer roadmap with checklist items aligned to the original scope.
 - [x] CREATE2 pair derivation fallback using factory init code hashes
 - [x] Router->factory mapping support in config
 - [x] Solidly addLiquidity decode + stable flag handling
-- [ ] Track candidate lifecycle in state machine
+- [ ] Factory PairCreated watcher + token watchlist (optional discovery feed)
+- [x] Launch-only liquidity gate (pair created or zero reserves in prior block)
+- [x] Launch gate strict/best-effort modes with historical-state handling
+- [x] Track candidate lifecycle in state machine
 
 ## Phase 3: Risk Filters (V1)
 - [x] Risk engine scaffolding with decision struct
-- [ ] ERC20 sanity checks (code size, decimals/name/symbol timeouts)
-- [ ] Sellability simulation (base->token->base via eth_call)
-- [ ] Tax estimation (expected vs simulated output)
-- [ ] Risk score and reason propagation to decision logs
+- [x] ERC20 sanity checks (code size, decimals/name/symbol timeouts)
+- [x] Sellability simulation (base->token->base via eth_call)
+- [x] Tax estimation (expected vs simulated output)
+- [x] Risk score and reason propagation to decision logs
 
 ## Phase 4: Execution Engine (V1)
 - [x] Executor tx builder for `buyV2`
@@ -44,10 +47,10 @@ Developer roadmap with checklist items aligned to the original scope.
 - [x] Nonce manager stub
 - [x] Sender stub for broadcast
 - [x] Solidly executor path (`buySolidly`)
-- [ ] Nonce resync on startup + periodic refresh
-- [ ] Gas bump/replace policy with `bump_pct` + interval
-- [ ] Confirm/receipt tracking with retry windows
-- [ ] Enforce maxBlockNumber guard in live flow
+- [x] Nonce resync on startup + periodic refresh
+- [x] Gas bump/replace policy with `bump_pct` + interval
+- [x] Confirm/receipt tracking with retry windows
+- [x] Enforce maxBlockNumber guard in live flow
 
 ## Phase 5: Strategy Orchestration (V1)
 - [x] Detect → qualify → execute loop wired
@@ -68,9 +71,12 @@ Developer roadmap with checklist items aligned to the original scope.
 - [ ] CLI command: `sniper deploy-contract` verify address + ABI hash
 - [ ] Replay harness with richer sample dataset
 - [ ] Integration tests with local sonic devnet
+- [ ] Telegram notifier for alerts and visibility (candidates, risk rejects, executions, PnL snapshots)
+- [ ] Optional Telegram control commands (restricted allowlist + audit log)
 
 ## Phase 8: Extensions (Post‑V1)
 - [x] Solidly router decoders + pair helpers
 - [ ] V3/CLMM decoders + pool math
+- [ ] Expand DEX coverage beyond V2/Solidly (CLMM/Balancer/Curve) after protocol support lands (deferred)
 - [ ] Multi-hop quoting helpers
 - [ ] MEV private relay integration (if Sonic relays appear)

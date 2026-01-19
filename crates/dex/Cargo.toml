@@ -12,3 +12,6 @@ lru.workspace = true
 serde.workspace = true
 sonic-core = { path = "../core" }
 tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

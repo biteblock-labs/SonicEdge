@@ -3792,6 +3792,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "anyhow",
+ "lru 0.12.5",
  "prometheus",
  "sonic-chain",
  "sonic-core",
@@ -3837,6 +3838,7 @@ dependencies = [
  "lru 0.12.5",
  "serde",
  "sonic-core",
+ "tokio",
  "tracing",
 ]
 
@@ -3847,6 +3849,7 @@ dependencies = [
  "alloy",
  "anyhow",
  "sonic-core",
+ "tokio",
  "tracing",
 ]
 
@@ -3857,6 +3860,7 @@ dependencies = [
  "alloy",
  "anyhow",
  "sonic-core",
+ "tokio",
  "tracing",
 ]
 

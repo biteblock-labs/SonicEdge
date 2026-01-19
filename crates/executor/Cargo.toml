@@ -10,3 +10,6 @@ alloy.workspace = true
 anyhow.workspace = true
 sonic-core = { path = "../core" }
 tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

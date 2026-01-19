@@ -23,8 +23,58 @@ impl NonceManager {
     }
 
     pub async fn sync(&self, provider: &DynProvider, address: Address) -> Result<u64> {
-        let nonce = provider.get_transaction_count(address).await?;
-        self.set(nonce);
-        Ok(nonce)
+        let pending = provider.get_transaction_count(address).pending().await?;
+        let current = self.next.load(Ordering::SeqCst);
+        let next = pending.max(current);
+        self.set(next);
+        Ok(next)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NonceManager;
+    use alloy::primitives::address;
+    use alloy::providers::{Provider, ProviderBuilder};
+    use alloy::transports::mock::Asserter;
+
+    #[tokio::test]
+    async fn sync_sets_next_nonce() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        asserter.push_success(&7u64);
+
+        let manager = NonceManager::new(0);
+        let nonce = manager
+            .sync(&provider, address!("0x1000000000000000000000000000000000000001"))
+            .await
+            .unwrap();
+
+        assert_eq!(nonce, 7);
+        assert_eq!(manager.next_nonce(), 7);
+        assert_eq!(manager.next_nonce(), 8);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_does_not_decrease_nonce() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        asserter.push_success(&5u64);
+
+        let manager = NonceManager::new(0);
+        manager.set(9);
+        let nonce = manager
+            .sync(&provider, address!("0x1000000000000000000000000000000000000001"))
+            .await
+            .unwrap();
+
+        assert_eq!(nonce, 9);
+        assert_eq!(manager.next_nonce(), 9);
+        assert!(asserter.read_q().is_empty());
     }
 }

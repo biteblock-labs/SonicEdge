@@ -20,7 +20,9 @@ solc --optimize --optimize-runs 200 --bin --abi SonicSniperExecutor.sol -o build
 ## Usage
 
 - `buyV2` performs an atomic UniswapV2-style swap with optional reserve and block guards.
+- `buyV2ETH` performs a native-asset swap using `msg.value` (expects `amountIn == msg.value`).
 - `buySolidly` performs a Solidly-style swap (route with stable/volatile flag) with the same guards.
+- `buySolidlyETH` performs a Solidly native-asset swap using `msg.value` (expects `amountIn == msg.value`).
 - Use `rescueToken` and `rescueETH` for emergency recovery.
 
 ## Notes

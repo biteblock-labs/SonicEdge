@@ -29,9 +29,13 @@ geth \
 - Prefer `dex.router_factories` to pin each router to its factory and avoid mismatches.
 - Populate `dex.factory_pair_code_hashes` to enable CREATE2 pair derivation on `getPair` misses.
 - Keep `dex.allow_execution_without_pair = false` unless you intentionally want to skip reserve guards.
+- Keep `dex.launch_only_liquidity_gate = true` to ignore non-launch liquidity adds.
+- Set `dex.launch_only_liquidity_gate_mode` to `strict` (default) or `best_effort` if your node can't serve prior-block state.
+- Set `dex.wrapped_native` (wS on Sonic) and include `0x0000000000000000000000000000000000000000` in `dex.base_tokens` to enable native-base execution.
 - Some Solidly routers (e.g. SwapX RouterV2) do not expose `WETH()/weth()` getters; verify the wrapped base token via docs or transfer traces (wS on Sonic mainnet).
 - Set `executor.executor_contract` to your deployed address.
 - Keep `min_base_amount` in raw base units.
+- Set `risk.sell_simulation_mode` (`strict`/`best_effort`) and `risk.sell_simulation_override_mode` (`detect`/`skip_any`) to tune sell simulation enforcement.
 
 ## Secrets
 - Export the hot wallet key:
@@ -46,7 +50,7 @@ export SNIPER_PK=0x<hex_private_key>
 - Compile and deploy `contracts/SonicSniperExecutor.sol` from your hot wallet.
 - Approve the executor to spend base token for the owner wallet.
 - Optional: call `setUseFeeOnTransfer(true)` for fee-on-transfer routers.
-- If you need Solidly execution, redeploy after updating the ABI to include `buySolidly`.
+- If you need Solidly/native execution, redeploy after updating the ABI to include `buySolidly`/`buySolidlyETH`/`buyV2ETH`.
 
 ## Run
 ```
@@ -68,6 +72,7 @@ just run
 - **No pending txs:** check WS endpoint, node WS config, or firewall.
 - **Tx fetch timeouts:** increase `tx_fetch_timeout_ms`.
 - **Missing liquidity adds:** ensure router list is correct, enable txpool backfill.
+- **Launch gate skips:** if you see historical state errors, set `dex.launch_only_liquidity_gate_mode = "best_effort"` or run a node that can serve prior-block state.
 - **Execution failures:** check approvals, contract address, gas settings.
 
 ## Emergency Actions

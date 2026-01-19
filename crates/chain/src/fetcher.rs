@@ -6,6 +6,7 @@ use anyhow::Result;
 use sonic_core::types::MempoolTx;
 use sonic_core::utils::now_ms;
 use std::time::Duration;
+use tracing::warn;
 
 pub struct TxFetcher {
     provider: DynProvider,
@@ -22,14 +23,32 @@ impl TxFetcher {
 
     pub async fn fetch(&self, hash: B256) -> Result<Option<MempoolTx>> {
         let fut = self.provider.get_transaction_by_hash(hash);
-        let tx_opt = tokio::time::timeout(self.timeout, fut).await??;
-        Ok(tx_opt.map(|tx| Self::map_tx(tx, now_ms())))
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(result) => {
+                let tx_opt = result?;
+                Ok(tx_opt.map(|tx| Self::map_tx(tx, now_ms())))
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    %hash,
+                    timeout_ms = self.timeout.as_millis(),
+                    "tx fetch timeout"
+                );
+                Ok(None)
+            }
+        }
     }
 
     fn map_tx<T>(tx: T, first_seen_ms: u64) -> MempoolTx
     where
         T: TransactionTrait + TransactionResponse,
     {
+        let max_fee_per_gas = if tx.is_legacy() || tx.is_eip2930() {
+            None
+        } else {
+            Some(TransactionTrait::max_fee_per_gas(&tx))
+        };
         MempoolTx {
             hash: tx.tx_hash(),
             from: tx.from(),
@@ -38,7 +57,7 @@ impl TxFetcher {
             value: tx.value(),
             nonce: tx.nonce(),
             gas_limit: tx.gas_limit(),
-            max_fee_per_gas: Some(TransactionTrait::max_fee_per_gas(&tx)),
+            max_fee_per_gas,
             max_priority_fee_per_gas: tx.max_priority_fee_per_gas(),
             first_seen_ms,
         }
