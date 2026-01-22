@@ -112,6 +112,17 @@ impl PairMetadataCache {
             .await
     }
 
+    pub fn invalidate(
+        &mut self,
+        factory: Address,
+        token_a: Address,
+        token_b: Address,
+        stable: Option<bool>,
+    ) {
+        let key = PairKey::new(factory, token_a, token_b, stable);
+        self.entries.pop(&key);
+    }
+
     async fn resolve_with_now(
         &mut self,
         provider: &DynProvider,
@@ -446,6 +457,21 @@ mod tests {
             .get_cached(PairKey::new(factory, token_a, token_b, None), 1_500)
             .expect("cache hit");
         assert!(cached.is_none());
+    }
+
+    #[test]
+    fn invalidate_removes_cached_entry() {
+        let factory = address!("0x0000000000000000000000000000000000000001");
+        let token_a = address!("0x0000000000000000000000000000000000000002");
+        let token_b = address!("0x0000000000000000000000000000000000000003");
+        let mut cache = PairMetadataCache::new(2, 1000, 1000, HashMap::new());
+        let key = PairKey::new(factory, token_a, token_b, None);
+
+        cache.insert_cached(key, None, 1_000);
+        assert!(cache.get_cached(key, 1_010).is_some());
+
+        cache.invalidate(factory, token_a, token_b, None);
+        assert!(cache.get_cached(key, 1_010).is_none());
     }
 
     #[test]

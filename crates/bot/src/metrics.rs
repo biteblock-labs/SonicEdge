@@ -1,5 +1,5 @@
 use anyhow::Result;
-use prometheus::{IntCounter, Opts};
+use prometheus::{IntCounter, IntCounterVec, IntGaugeVec, Opts};
 use sonic_chain::ChannelMetrics;
 use sonic_core::metrics::Metrics;
 use std::io::{Read, Write};
@@ -14,6 +14,10 @@ pub struct BotMetrics {
     pub txpool: ChannelMetrics,
     pub heads: ChannelMetrics,
     pub dedup_hits: IntCounter,
+    pub candidates_total: IntCounter,
+    pub executions_total: IntCounter,
+    pub failures_total: IntCounterVec,
+    pub router_sellability: IntGaugeVec,
 }
 
 impl BotMetrics {
@@ -28,6 +32,32 @@ impl BotMetrics {
             "Total duplicate tx hashes filtered by the deduper",
         ))?;
         registry.register(Box::new(dedup_hits.clone()))?;
+        let candidates_total = IntCounter::with_opts(Opts::new(
+            "sonic_candidates_total",
+            "Total liquidity candidates detected",
+        ))?;
+        registry.register(Box::new(candidates_total.clone()))?;
+        let executions_total = IntCounter::with_opts(Opts::new(
+            "sonic_exec_total",
+            "Total execution transactions sent",
+        ))?;
+        registry.register(Box::new(executions_total.clone()))?;
+        let failures_total = IntCounterVec::new(
+            Opts::new(
+                "sonic_failures_total",
+                "Total candidate failures by kind",
+            ),
+            &["kind"],
+        )?;
+        registry.register(Box::new(failures_total.clone()))?;
+        let router_sellability = IntGaugeVec::new(
+            Opts::new(
+                "sonic_router_sellability",
+                "Router sellability verification result (1=enabled, 0=disabled)",
+            ),
+            &["router", "kind"],
+        )?;
+        registry.register(Box::new(router_sellability.clone()))?;
 
         Ok(Self {
             metrics,
@@ -35,6 +65,10 @@ impl BotMetrics {
             txpool,
             heads,
             dedup_hits,
+            candidates_total,
+            executions_total,
+            failures_total,
+            router_sellability,
         })
     }
 

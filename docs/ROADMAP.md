@@ -29,6 +29,7 @@ Developer roadmap with checklist items aligned to the original scope.
 - [x] CREATE2 pair derivation fallback using factory init code hashes
 - [x] Router->factory mapping support in config
 - [x] Solidly addLiquidity decode + stable flag handling
+- [ ] Add Sonic-native DEX registry entries (Spooky V2, Equalizer Solidly, DeFive V2) after on-chain verification
 - [ ] Factory PairCreated watcher + token watchlist (optional discovery feed)
 - [x] Launch-only liquidity gate (pair created or zero reserves in prior block)
 - [x] Launch gate strict/best-effort modes with historical-state handling
@@ -54,23 +55,28 @@ Developer roadmap with checklist items aligned to the original scope.
 
 ## Phase 5: Strategy Orchestration (V1)
 - [x] Detect → qualify → execute loop wired
-- [ ] Wait-for-mine logic on addLiquidity receipt (primary execution path)
-- [ ] Optional same-block attempt strategy with guardrails
-- [ ] Position tracking + basic exit loop (TP/SL/max hold)
-- [ ] Emergency triggers (reserve drop, sell sim failure)
+- [x] Wait-for-mine logic on addLiquidity receipt (primary execution path)
+- [x] Optional same-block attempt strategy with guardrails
+- [x] Position tracking + basic exit loop (TP/SL/max hold)
+- [x] Position persistence across restarts
+- [x] Router sellability recheck timer
+- [x] Emergency triggers (reserve drop, sell sim failure)
 
 ## Phase 6: Observability (V1)
 - [x] Tracing logging scaffold
 - [x] Metrics scaffold feature flag
 - [x] Prometheus counters/gauges (ingestion queue depth/drops, dedup hits)
-- [ ] Prometheus counters/gauges (candidates, exec, failures)
-- [ ] Structured JSON logs option
+- [x] Prometheus counters/gauges (candidates, exec, failures)
+- [x] Structured JSON logs option
 
 ## Phase 7: Hardening & Ops
-- [ ] Key management guide (env, HSM, file perms)
-- [ ] CLI command: `sniper deploy-contract` verify address + ABI hash
+- [x] Key management guide (env, HSM, file perms)
+- [x] Config validation on startup (required fields + bounds)
+- [x] CLI command: `sniper deploy-contract` verify address + ABI hash
 - [ ] Replay harness with richer sample dataset
+- [ ] Decide and document full-pipeline verification approach (replay harness vs anvil) with acceptance criteria
 - [ ] Integration tests with local sonic devnet
+- [ ] End-to-end pipeline smoke test harness on anvil/local chain (liquidity add → execution → exits → restart)
 - [ ] Telegram notifier for alerts and visibility (candidates, risk rejects, executions, PnL snapshots)
 - [ ] Optional Telegram control commands (restricted allowlist + audit log)
 
@@ -80,3 +86,4 @@ Developer roadmap with checklist items aligned to the original scope.
 - [ ] Expand DEX coverage beyond V2/Solidly (CLMM/Balancer/Curve) after protocol support lands (deferred)
 - [ ] Multi-hop quoting helpers
 - [ ] MEV private relay integration (if Sonic relays appear)
+- [ ] Config-driven knobs for current hard-coded behaviors (risk scoring, head freshness, reserve/slippage guards, revert pattern lists)

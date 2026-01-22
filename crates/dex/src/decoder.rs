@@ -174,6 +174,32 @@ mod tests {
     }
 
     #[test]
+    fn decode_add_liquidity_eth() {
+        let call = IUniswapV2Router02::addLiquidityETHCall {
+            token: address!("0x1000000000000000000000000000000000000001"),
+            amountTokenDesired: U256::from(1_000u64),
+            amountTokenMin: U256::from(900u64),
+            amountETHMin: U256::from(2_000u64),
+            to: address!("0x3000000000000000000000000000000000000003"),
+            deadline: U256::from(123u64),
+        };
+
+        let data = call.abi_encode();
+        let decoded = decode_router_calldata(&data).unwrap();
+        match decoded {
+            Some(RouterCall::AddLiquidityEth(add)) => {
+                assert_eq!(add.token, call.token);
+                assert_eq!(add.amount_token_desired, call.amountTokenDesired);
+                assert_eq!(add.amount_token_min, call.amountTokenMin);
+                assert_eq!(add.amount_eth_min, call.amountETHMin);
+                assert_eq!(add.to, call.to);
+                assert_eq!(add.deadline, call.deadline);
+            }
+            _ => panic!("unexpected decode"),
+        }
+    }
+
+    #[test]
     fn decode_solidly_add_liquidity() {
         let call = ISolidlyRouter::addLiquidityCall {
             tokenA: address!("0x1000000000000000000000000000000000000001"),

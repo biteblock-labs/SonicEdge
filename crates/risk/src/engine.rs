@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use crate::abi::{IERC20, IUniswapV2Router02};
+use crate::abi::{IERC20, ISolidlyRouter, IUniswapV2Router02, Route};
 use crate::types::RiskDecision;
 
 struct RiskFinding {
@@ -58,6 +58,8 @@ pub struct RiskContext<'a> {
     pub base_token: Address,
     pub token: Address,
     pub pair: Option<Address>,
+    pub stable: Option<bool>,
+    pub sellability_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,6 +193,10 @@ impl RiskEngine {
 
     async fn check_sellability_and_tax(&self, ctx: &RiskContext<'_>) -> Vec<RiskFinding> {
         let mut findings = Vec::new();
+        if !ctx.sellability_enabled {
+            debug!("sellability check disabled for router");
+            return findings;
+        }
         if self.sellability_amount_base.is_zero() {
             debug!("sellability check disabled");
             return findings;
@@ -230,6 +236,10 @@ impl RiskEngine {
         {
             Ok(amounts) => amounts,
             Err(reason) => {
+                if self.sell_simulation_mode == SellSimulationMode::BestEffort {
+                    warn!(reason = %reason, "router quote failed; skipping sellability check");
+                    return findings;
+                }
                 findings.push(RiskFinding::new(reason, SCORE_HIGH));
                 return findings;
             }
@@ -256,6 +266,10 @@ impl RiskEngine {
         {
             Ok(amounts) => amounts,
             Err(reason) => {
+                if self.sell_simulation_mode == SellSimulationMode::BestEffort {
+                    warn!(reason = %reason, "router reverse quote failed; skipping sellability check");
+                    return findings;
+                }
                 findings.push(RiskFinding::new(reason, SCORE_HIGH));
                 return findings;
             }
@@ -375,20 +389,52 @@ impl RiskEngine {
         amount_in: U256,
         path: Vec<Address>,
     ) -> Result<Vec<U256>, String> {
-        let call = IUniswapV2Router02::getAmountsOutCall { amountIn: amount_in, path };
-        let tx = TransactionRequest {
-            to: Some(TxKind::Call(ctx.router)),
-            input: TransactionInput::new(call.abi_encode().into()),
-            ..Default::default()
-        };
-        let data = self
-            .with_timeout("router getAmountsOut", async { ctx.provider.call(tx).await })
-            .await?;
-        IUniswapV2Router02::getAmountsOutCall::abi_decode_returns(&data)
-            .map_err(|err| format!("router getAmountsOut decode failed: {err}"))
+        if let Some(stable) = ctx.stable {
+            let routes = Self::solidly_routes_from_path(&path, stable)?;
+            let call = ISolidlyRouter::getAmountsOutCall {
+                amountIn: amount_in,
+                routes,
+            };
+            let tx = TransactionRequest {
+                to: Some(TxKind::Call(ctx.router)),
+                input: TransactionInput::new(call.abi_encode().into()),
+                ..Default::default()
+            };
+            let data = self
+                .with_timeout("router getAmountsOut", async { ctx.provider.call(tx).await })
+                .await?;
+            ISolidlyRouter::getAmountsOutCall::abi_decode_returns(&data)
+                .map_err(|err| format!("router getAmountsOut decode failed: {err}"))
+        } else {
+            let call = IUniswapV2Router02::getAmountsOutCall { amountIn: amount_in, path };
+            let tx = TransactionRequest {
+                to: Some(TxKind::Call(ctx.router)),
+                input: TransactionInput::new(call.abi_encode().into()),
+                ..Default::default()
+            };
+            let data = self
+                .with_timeout("router getAmountsOut", async { ctx.provider.call(tx).await })
+                .await?;
+            IUniswapV2Router02::getAmountsOutCall::abi_decode_returns(&data)
+                .map_err(|err| format!("router getAmountsOut decode failed: {err}"))
+        }
     }
 
     async fn simulate_sell(
+        &self,
+        ctx: &RiskContext<'_>,
+        amount_in: U256,
+        path: Vec<Address>,
+    ) -> Result<SellSimulationResult, String> {
+        if let Some(stable) = ctx.stable {
+            return self
+                .simulate_sell_solidly(ctx, amount_in, path, stable)
+                .await;
+        }
+        self.simulate_sell_v2(ctx, amount_in, path).await
+    }
+
+    async fn simulate_sell_v2(
         &self,
         ctx: &RiskContext<'_>,
         amount_in: U256,
@@ -407,7 +453,8 @@ impl RiskEngine {
             input: TransactionInput::new(call.abi_encode().into()),
             ..Default::default()
         };
-        let overrides = sell_simulation_overrides(ctx.token, SIMULATION_SENDER, ctx.router, amount_in);
+        let overrides =
+            sell_simulation_overrides(ctx.token, SIMULATION_SENDER, ctx.router, amount_in);
         let data = self
             .with_timeout("router swapExactTokensForTokens (simulated)", async {
                 ctx.provider.call(tx).overrides(overrides).await
@@ -461,6 +508,63 @@ impl RiskEngine {
         Ok(SellSimulationResult::Amount(amounts[amounts.len() - 1]))
     }
 
+    async fn simulate_sell_solidly(
+        &self,
+        ctx: &RiskContext<'_>,
+        amount_in: U256,
+        path: Vec<Address>,
+        stable: bool,
+    ) -> Result<SellSimulationResult, String> {
+        let routes = Self::solidly_routes_from_path(&path, stable)?;
+        let call = ISolidlyRouter::swapExactTokensForTokensCall {
+            amountIn: amount_in,
+            amountOutMin: U256::from(0u64),
+            routes,
+            to: SIMULATION_SENDER,
+            deadline: U256::from(SIMULATION_DEADLINE_SECS),
+        };
+        let tx = TransactionRequest {
+            from: Some(SIMULATION_SENDER),
+            to: Some(TxKind::Call(ctx.router)),
+            input: TransactionInput::new(call.abi_encode().into()),
+            ..Default::default()
+        };
+        let overrides =
+            sell_simulation_overrides(ctx.token, SIMULATION_SENDER, ctx.router, amount_in);
+        let data = self
+            .with_timeout("router swapExactTokensForTokens (simulated)", async {
+                ctx.provider.call(tx).overrides(overrides).await
+            })
+            .await;
+        let data = match data {
+            Ok(data) => data,
+            Err(reason) => {
+                if self.sell_simulation_mode == SellSimulationMode::BestEffort
+                    && is_fee_on_transfer_revert(&reason)
+                {
+                    return Ok(SellSimulationResult::Skipped(
+                        "fee-on-transfer swap unsupported on Solidly".to_string(),
+                    ));
+                }
+                if self.sell_simulation_mode == SellSimulationMode::BestEffort
+                    && should_skip_override_error(&reason, self.sell_simulation_override_mode)
+                {
+                    return Ok(SellSimulationResult::Skipped(override_skip_message(
+                        &reason,
+                        self.sell_simulation_override_mode,
+                    )));
+                }
+                return Err(reason);
+            }
+        };
+        let amounts = ISolidlyRouter::swapExactTokensForTokensCall::abi_decode_returns(&data)
+            .map_err(|err| format!("router swapExactTokensForTokens decode failed: {err}"))?;
+        if amounts.len() < 2 {
+            return Err("router swap returned insufficient hop count".to_string());
+        }
+        Ok(SellSimulationResult::Amount(amounts[amounts.len() - 1]))
+    }
+
     async fn simulate_sell_supporting_fee_on_transfer(
         &self,
         ctx: &RiskContext<'_>,
@@ -488,6 +592,24 @@ impl RiskEngine {
         )
         .await?;
         Ok(())
+    }
+
+    fn solidly_routes_from_path(
+        path: &[Address],
+        stable: bool,
+    ) -> Result<Vec<Route>, String> {
+        if path.len() < 2 {
+            return Err("router path must include at least two tokens".to_string());
+        }
+        let routes = path
+            .windows(2)
+            .map(|window| Route {
+                from: window[0],
+                to: window[1],
+                stable,
+            })
+            .collect();
+        Ok(routes)
     }
 
     async fn pair_reserves(
@@ -648,7 +770,7 @@ mod tests {
     use alloy::transports::mock::Asserter;
     use sonic_core::config::RiskConfig;
 
-    use crate::abi::{IERC20, IUniswapV2Pair, IUniswapV2Router02};
+    use crate::abi::{IERC20, ISolidlyRouter, IUniswapV2Pair, IUniswapV2Router02};
 
     #[test]
     fn loss_bps_zero_on_gain() {
@@ -689,6 +811,8 @@ mod tests {
             base_token: address!("0x2000000000000000000000000000000000000002"),
             token: address!("0x3000000000000000000000000000000000000003"),
             pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: None,
+            sellability_enabled: true,
         };
 
         asserter.push_success(&Bytes::from(vec![1u8]));
@@ -759,6 +883,8 @@ mod tests {
             base_token: address!("0x2000000000000000000000000000000000000002"),
             token: address!("0x3000000000000000000000000000000000000003"),
             pair: None,
+            stable: None,
+            sellability_enabled: true,
         };
 
         asserter.push_success(&Bytes::from(vec![1u8]));
@@ -799,6 +925,8 @@ mod tests {
             base_token: address!("0x2000000000000000000000000000000000000002"),
             token: address!("0x3000000000000000000000000000000000000003"),
             pair: None,
+            stable: None,
+            sellability_enabled: true,
         };
 
         asserter.push_success(&Bytes::from(vec![1u8]));
@@ -839,6 +967,8 @@ mod tests {
             base_token: address!("0x2000000000000000000000000000000000000002"),
             token: address!("0x3000000000000000000000000000000000000003"),
             pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: None,
+            sellability_enabled: true,
         };
 
         asserter.push_success(&Bytes::from(vec![1u8]));
@@ -872,6 +1002,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assess_passes_with_solidly_router_quotes() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "1000".to_string(),
+            max_tax_bps: 1000,
+            erc20_call_timeout_ms: 500,
+            sell_simulation_mode: "strict".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: Some(true),
+            sellability_enabled: true,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"TestToken".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TST".to_string()),
+        );
+
+        type U112 = Uint<112, 2>;
+        type ReservesReturn = <IUniswapV2Pair::getReservesCall as SolCall>::Return;
+        let reserves = ReservesReturn {
+            reserve0: U112::from(1_000u64),
+            reserve1: U112::from(2_000u64),
+            blockTimestampLast: 1u32,
+        };
+        push_bytes(
+            &asserter,
+            IUniswapV2Pair::getReservesCall::abi_encode_returns(&reserves),
+        );
+
+        let forward = vec![U256::from(1000u64), U256::from(900u64)];
+        push_bytes(
+            &asserter,
+            ISolidlyRouter::getAmountsOutCall::abi_encode_returns(&forward),
+        );
+        let backward = vec![U256::from(900u64), U256::from(1000u64)];
+        push_bytes(
+            &asserter,
+            ISolidlyRouter::getAmountsOutCall::abi_encode_returns(&backward),
+        );
+        let simulated = vec![U256::from(900u64), U256::from(1000u64)];
+        push_bytes(
+            &asserter,
+            ISolidlyRouter::swapExactTokensForTokensCall::abi_encode_returns(&simulated),
+        );
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(decision.pass);
+        assert_eq!(decision.score, 0);
+        assert!(decision.reasons.is_empty());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assess_passes_when_router_quote_fails_in_best_effort() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "1000".to_string(),
+            max_tax_bps: 100,
+            erc20_call_timeout_ms: 500,
+            sell_simulation_mode: "best_effort".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: None,
+            sellability_enabled: true,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"TestToken".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TST".to_string()),
+        );
+
+        type U112 = Uint<112, 2>;
+        type ReservesReturn = <IUniswapV2Pair::getReservesCall as SolCall>::Return;
+        let reserves = ReservesReturn {
+            reserve0: U112::from(1_000u64),
+            reserve1: U112::from(2_000u64),
+            blockTimestampLast: 1u32,
+        };
+        push_bytes(
+            &asserter,
+            IUniswapV2Pair::getReservesCall::abi_encode_returns(&reserves),
+        );
+
+        asserter.push_failure_msg("router getAmountsOut failed");
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(decision.pass);
+        assert_eq!(decision.score, 0);
+        assert!(decision.reasons.is_empty());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assess_rejects_when_router_quote_fails_in_strict() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "1000".to_string(),
+            max_tax_bps: 100,
+            erc20_call_timeout_ms: 500,
+            sell_simulation_mode: "strict".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: None,
+            sellability_enabled: true,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"TestToken".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TST".to_string()),
+        );
+
+        type U112 = Uint<112, 2>;
+        type ReservesReturn = <IUniswapV2Pair::getReservesCall as SolCall>::Return;
+        let reserves = ReservesReturn {
+            reserve0: U112::from(1_000u64),
+            reserve1: U112::from(2_000u64),
+            blockTimestampLast: 1u32,
+        };
+        push_bytes(
+            &asserter,
+            IUniswapV2Pair::getReservesCall::abi_encode_returns(&reserves),
+        );
+
+        asserter.push_failure_msg("router getAmountsOut failed");
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(!decision.pass);
+        assert!(decision.score >= SCORE_HIGH);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("router getAmountsOut failed")));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
     async fn assess_passes_when_state_overrides_unsupported_in_best_effort() {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new()
@@ -891,6 +1206,8 @@ mod tests {
             base_token: address!("0x2000000000000000000000000000000000000002"),
             token: address!("0x3000000000000000000000000000000000000003"),
             pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: None,
+            sellability_enabled: true,
         };
 
         asserter.push_success(&Bytes::from(vec![1u8]));
@@ -954,6 +1271,8 @@ mod tests {
             base_token: address!("0x2000000000000000000000000000000000000002"),
             token: address!("0x3000000000000000000000000000000000000003"),
             pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: None,
+            sellability_enabled: true,
         };
 
         asserter.push_success(&Bytes::from(vec![1u8]));
@@ -1019,6 +1338,8 @@ mod tests {
             base_token: address!("0x2000000000000000000000000000000000000002"),
             token: address!("0x3000000000000000000000000000000000000003"),
             pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: None,
+            sellability_enabled: true,
         };
 
         asserter.push_success(&Bytes::from(vec![1u8]));
@@ -1086,6 +1407,8 @@ mod tests {
             base_token: address!("0x2000000000000000000000000000000000000002"),
             token: address!("0x3000000000000000000000000000000000000003"),
             pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: None,
+            sellability_enabled: true,
         };
 
         asserter.push_success(&Bytes::from(vec![1u8]));
@@ -1150,6 +1473,8 @@ mod tests {
             base_token: address!("0x2000000000000000000000000000000000000002"),
             token: address!("0x3000000000000000000000000000000000000003"),
             pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: None,
+            sellability_enabled: true,
         };
 
         asserter.push_success(&Bytes::from(vec![1u8]));

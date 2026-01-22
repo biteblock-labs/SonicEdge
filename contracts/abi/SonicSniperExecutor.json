@@ -4,19 +4,52 @@
     "name": "buyV2",
     "stateMutability": "nonpayable",
     "inputs": [
-      { "name": "router", "type": "address" },
-      { "name": "path", "type": "address[]" },
-      { "name": "amountIn", "type": "uint256" },
-      { "name": "minAmountOut", "type": "uint256" },
-      { "name": "recipient", "type": "address" },
-      { "name": "deadline", "type": "uint256" },
-      { "name": "pair", "type": "address" },
-      { "name": "minBaseReserve", "type": "uint112" },
-      { "name": "minTokenReserve", "type": "uint112" },
-      { "name": "maxBlockNumber", "type": "uint64" }
+      {
+        "name": "router",
+        "type": "address"
+      },
+      {
+        "name": "path",
+        "type": "address[]"
+      },
+      {
+        "name": "amountIn",
+        "type": "uint256"
+      },
+      {
+        "name": "minAmountOut",
+        "type": "uint256"
+      },
+      {
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "name": "deadline",
+        "type": "uint256"
+      },
+      {
+        "name": "pair",
+        "type": "address"
+      },
+      {
+        "name": "minBaseReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "minTokenReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "maxBlockNumber",
+        "type": "uint64"
+      }
     ],
     "outputs": [
-      { "name": "amountOut", "type": "uint256" }
+      {
+        "name": "amountOut",
+        "type": "uint256"
+      }
     ]
   },
   {
@@ -24,19 +57,52 @@
     "name": "buyV2ETH",
     "stateMutability": "payable",
     "inputs": [
-      { "name": "router", "type": "address" },
-      { "name": "path", "type": "address[]" },
-      { "name": "amountIn", "type": "uint256" },
-      { "name": "minAmountOut", "type": "uint256" },
-      { "name": "recipient", "type": "address" },
-      { "name": "deadline", "type": "uint256" },
-      { "name": "pair", "type": "address" },
-      { "name": "minBaseReserve", "type": "uint112" },
-      { "name": "minTokenReserve", "type": "uint112" },
-      { "name": "maxBlockNumber", "type": "uint64" }
+      {
+        "name": "router",
+        "type": "address"
+      },
+      {
+        "name": "path",
+        "type": "address[]"
+      },
+      {
+        "name": "amountIn",
+        "type": "uint256"
+      },
+      {
+        "name": "minAmountOut",
+        "type": "uint256"
+      },
+      {
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "name": "deadline",
+        "type": "uint256"
+      },
+      {
+        "name": "pair",
+        "type": "address"
+      },
+      {
+        "name": "minBaseReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "minTokenReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "maxBlockNumber",
+        "type": "uint64"
+      }
     ],
     "outputs": [
-      { "name": "amountOut", "type": "uint256" }
+      {
+        "name": "amountOut",
+        "type": "uint256"
+      }
     ]
   },
   {
@@ -44,21 +110,60 @@
     "name": "buySolidly",
     "stateMutability": "nonpayable",
     "inputs": [
-      { "name": "router", "type": "address" },
-      { "name": "tokenIn", "type": "address" },
-      { "name": "tokenOut", "type": "address" },
-      { "name": "stable", "type": "bool" },
-      { "name": "amountIn", "type": "uint256" },
-      { "name": "minAmountOut", "type": "uint256" },
-      { "name": "recipient", "type": "address" },
-      { "name": "deadline", "type": "uint256" },
-      { "name": "pair", "type": "address" },
-      { "name": "minBaseReserve", "type": "uint112" },
-      { "name": "minTokenReserve", "type": "uint112" },
-      { "name": "maxBlockNumber", "type": "uint64" }
+      {
+        "name": "router",
+        "type": "address"
+      },
+      {
+        "name": "tokenIn",
+        "type": "address"
+      },
+      {
+        "name": "tokenOut",
+        "type": "address"
+      },
+      {
+        "name": "stable",
+        "type": "bool"
+      },
+      {
+        "name": "amountIn",
+        "type": "uint256"
+      },
+      {
+        "name": "minAmountOut",
+        "type": "uint256"
+      },
+      {
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "name": "deadline",
+        "type": "uint256"
+      },
+      {
+        "name": "pair",
+        "type": "address"
+      },
+      {
+        "name": "minBaseReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "minTokenReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "maxBlockNumber",
+        "type": "uint64"
+      }
     ],
     "outputs": [
-      { "name": "amountOut", "type": "uint256" }
+      {
+        "name": "amountOut",
+        "type": "uint256"
+      }
     ]
   },
   {
@@ -66,31 +171,307 @@
     "name": "buySolidlyETH",
     "stateMutability": "payable",
     "inputs": [
-      { "name": "router", "type": "address" },
-      { "name": "tokenIn", "type": "address" },
-      { "name": "tokenOut", "type": "address" },
-      { "name": "stable", "type": "bool" },
-      { "name": "amountIn", "type": "uint256" },
-      { "name": "minAmountOut", "type": "uint256" },
-      { "name": "recipient", "type": "address" },
-      { "name": "deadline", "type": "uint256" },
-      { "name": "pair", "type": "address" },
-      { "name": "minBaseReserve", "type": "uint112" },
-      { "name": "minTokenReserve", "type": "uint112" },
-      { "name": "maxBlockNumber", "type": "uint64" }
+      {
+        "name": "router",
+        "type": "address"
+      },
+      {
+        "name": "tokenIn",
+        "type": "address"
+      },
+      {
+        "name": "tokenOut",
+        "type": "address"
+      },
+      {
+        "name": "stable",
+        "type": "bool"
+      },
+      {
+        "name": "amountIn",
+        "type": "uint256"
+      },
+      {
+        "name": "minAmountOut",
+        "type": "uint256"
+      },
+      {
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "name": "deadline",
+        "type": "uint256"
+      },
+      {
+        "name": "pair",
+        "type": "address"
+      },
+      {
+        "name": "minBaseReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "minTokenReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "maxBlockNumber",
+        "type": "uint64"
+      }
     ],
     "outputs": [
-      { "name": "amountOut", "type": "uint256" }
+      {
+        "name": "amountOut",
+        "type": "uint256"
+      }
     ]
+  },
+  {
+    "type": "function",
+    "name": "sellV2",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      {
+        "name": "router",
+        "type": "address"
+      },
+      {
+        "name": "path",
+        "type": "address[]"
+      },
+      {
+        "name": "amountIn",
+        "type": "uint256"
+      },
+      {
+        "name": "minAmountOut",
+        "type": "uint256"
+      },
+      {
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "name": "deadline",
+        "type": "uint256"
+      },
+      {
+        "name": "pair",
+        "type": "address"
+      },
+      {
+        "name": "minBaseReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "minTokenReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "maxBlockNumber",
+        "type": "uint64"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "amountOut",
+        "type": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "function",
+    "name": "sellV2ETH",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      {
+        "name": "router",
+        "type": "address"
+      },
+      {
+        "name": "path",
+        "type": "address[]"
+      },
+      {
+        "name": "amountIn",
+        "type": "uint256"
+      },
+      {
+        "name": "minAmountOut",
+        "type": "uint256"
+      },
+      {
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "name": "deadline",
+        "type": "uint256"
+      },
+      {
+        "name": "pair",
+        "type": "address"
+      },
+      {
+        "name": "minBaseReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "minTokenReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "maxBlockNumber",
+        "type": "uint64"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "amountOut",
+        "type": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "function",
+    "name": "sellSolidly",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      {
+        "name": "router",
+        "type": "address"
+      },
+      {
+        "name": "tokenIn",
+        "type": "address"
+      },
+      {
+        "name": "tokenOut",
+        "type": "address"
+      },
+      {
+        "name": "stable",
+        "type": "bool"
+      },
+      {
+        "name": "amountIn",
+        "type": "uint256"
+      },
+      {
+        "name": "minAmountOut",
+        "type": "uint256"
+      },
+      {
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "name": "deadline",
+        "type": "uint256"
+      },
+      {
+        "name": "pair",
+        "type": "address"
+      },
+      {
+        "name": "minBaseReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "minTokenReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "maxBlockNumber",
+        "type": "uint64"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "amountOut",
+        "type": "uint256"
+      }
+    ]
+  },
+  {
+    "inputs": [
+      {
+        "name": "router",
+        "type": "address"
+      },
+      {
+        "name": "tokenIn",
+        "type": "address"
+      },
+      {
+        "name": "tokenOut",
+        "type": "address"
+      },
+      {
+        "name": "stable",
+        "type": "bool"
+      },
+      {
+        "name": "amountIn",
+        "type": "uint256"
+      },
+      {
+        "name": "minAmountOut",
+        "type": "uint256"
+      },
+      {
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "name": "deadline",
+        "type": "uint256"
+      },
+      {
+        "name": "pair",
+        "type": "address"
+      },
+      {
+        "name": "minBaseReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "minTokenReserve",
+        "type": "uint112"
+      },
+      {
+        "name": "maxBlockNumber",
+        "type": "uint64"
+      }
+    ],
+    "name": "sellSolidlyETH",
+    "outputs": [
+      {
+        "name": "amountOut",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
   },
   {
     "type": "function",
     "name": "rescueToken",
     "stateMutability": "nonpayable",
     "inputs": [
-      { "name": "token", "type": "address" },
-      { "name": "to", "type": "address" },
-      { "name": "amount", "type": "uint256" }
+      {
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "name": "to",
+        "type": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256"
+      }
     ],
     "outputs": []
   },
@@ -99,8 +480,14 @@
     "name": "rescueETH",
     "stateMutability": "nonpayable",
     "inputs": [
-      { "name": "to", "type": "address" },
-      { "name": "amount", "type": "uint256" }
+      {
+        "name": "to",
+        "type": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256"
+      }
     ],
     "outputs": []
   },
@@ -109,7 +496,10 @@
     "name": "setUseFeeOnTransfer",
     "stateMutability": "nonpayable",
     "inputs": [
-      { "name": "value", "type": "bool" }
+      {
+        "name": "value",
+        "type": "bool"
+      }
     ],
     "outputs": []
   },
@@ -119,7 +509,10 @@
     "stateMutability": "view",
     "inputs": [],
     "outputs": [
-      { "name": "", "type": "address" }
+      {
+        "name": "",
+        "type": "address"
+      }
     ]
   },
   {
@@ -128,20 +521,93 @@
     "stateMutability": "view",
     "inputs": [],
     "outputs": [
-      { "name": "", "type": "bool" }
+      {
+        "name": "",
+        "type": "bool"
+      }
     ]
   },
   {
     "type": "event",
     "name": "Bought",
     "inputs": [
-      { "name": "router", "type": "address", "indexed": true },
-      { "name": "tokenIn", "type": "address", "indexed": true },
-      { "name": "tokenOut", "type": "address", "indexed": true },
-      { "name": "amountIn", "type": "uint256", "indexed": false },
-      { "name": "minOut", "type": "uint256", "indexed": false },
-      { "name": "recipient", "type": "address", "indexed": false },
-      { "name": "blockNumber", "type": "uint256", "indexed": false }
+      {
+        "name": "router",
+        "type": "address",
+        "indexed": true
+      },
+      {
+        "name": "tokenIn",
+        "type": "address",
+        "indexed": true
+      },
+      {
+        "name": "tokenOut",
+        "type": "address",
+        "indexed": true
+      },
+      {
+        "name": "amountIn",
+        "type": "uint256",
+        "indexed": false
+      },
+      {
+        "name": "minOut",
+        "type": "uint256",
+        "indexed": false
+      },
+      {
+        "name": "recipient",
+        "type": "address",
+        "indexed": false
+      },
+      {
+        "name": "blockNumber",
+        "type": "uint256",
+        "indexed": false
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "Sold",
+    "inputs": [
+      {
+        "name": "router",
+        "type": "address",
+        "indexed": true
+      },
+      {
+        "name": "tokenIn",
+        "type": "address",
+        "indexed": true
+      },
+      {
+        "name": "tokenOut",
+        "type": "address",
+        "indexed": true
+      },
+      {
+        "name": "amountIn",
+        "type": "uint256",
+        "indexed": false
+      },
+      {
+        "name": "minOut",
+        "type": "uint256",
+        "indexed": false
+      },
+      {
+        "name": "recipient",
+        "type": "address",
+        "indexed": false
+      },
+      {
+        "name": "blockNumber",
+        "type": "uint256",
+        "indexed": false
+      }
     ],
     "anonymous": false
   }

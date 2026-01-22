@@ -8,8 +8,11 @@ Minimal on-chain executor for atomic UniswapV2-style swaps with safety guards.
 - Example (solc):
 
 ```
-solc --optimize --optimize-runs 200 --bin --abi SonicSniperExecutor.sol -o build
+solc --optimize --optimize-runs 200 --bin --bin-runtime --abi SonicSniperExecutor.sol -o build
 ```
+
+- The runtime bytecode (`*.bin-runtime`) is what `sniper deploy-contract` compares against on-chain code; copy it to `contracts/bytecode/SonicSniperExecutor.hex` if you want local match checks.
+- `sniper deploy-contract` prints a canonical ABI hash using `contracts/abi/SonicSniperExecutor.json`.
 
 ## Deploy
 

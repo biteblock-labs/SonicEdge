@@ -10,6 +10,8 @@ alloy.workspace = true
 anyhow.workspace = true
 lru.workspace = true
 prometheus.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sonic-chain = { path = "../chain" }
 sonic-core = { path = "../core", features = ["metrics"] }
 sonic-dex = { path = "../dex" }

@@ -10,6 +10,10 @@ interface IERC20 {
     function transferFrom(address from, address to, uint256 value) external returns (bool);
 }
 
+interface IWETH {
+    function withdraw(uint256 amount) external;
+}
+
 library SafeERC20 {
     function safeTransfer(IERC20 token, address to, uint256 value) internal {
         _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
@@ -42,6 +46,22 @@ interface IUniswapV2Router02 {
     ) external returns (uint256[] memory amounts);
 
     function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+
+    function swapExactTokensForETH(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
         uint256 amountIn,
         uint256 amountOutMin,
         address[] calldata path,
@@ -107,6 +127,16 @@ contract SonicSniperExecutor {
         uint256 blockNumber
     );
 
+    event Sold(
+        address indexed router,
+        address indexed tokenIn,
+        address indexed tokenOut,
+        uint256 amountIn,
+        uint256 minOut,
+        address recipient,
+        uint256 blockNumber
+    );
+
     modifier onlyOwner() {
         require(msg.sender == owner, "NOT_OWNER");
         _;
@@ -150,15 +180,24 @@ contract SonicSniperExecutor {
         if (balance < amountIn) {
             tokenIn.safeTransferFrom(owner, address(this), amountIn - balance);
         }
+        uint256 swapAmount = tokenIn.balanceOf(address(this));
+        if (swapAmount > amountIn) {
+            swapAmount = amountIn;
+        }
+
+        uint256 minOut = minAmountOut;
+        if (useFeeOnTransfer && amountIn > 0 && swapAmount < amountIn) {
+            minOut = (minAmountOut * swapAmount) / amountIn;
+        }
 
         tokenIn.safeApprove(router, 0);
-        tokenIn.safeApprove(router, amountIn);
+        tokenIn.safeApprove(router, useFeeOnTransfer ? swapAmount : amountIn);
 
         if (useFeeOnTransfer) {
             uint256 beforeBal = IERC20(path[path.length - 1]).balanceOf(to);
             IUniswapV2Router02(router).swapExactTokensForTokensSupportingFeeOnTransferTokens(
-                amountIn,
-                minAmountOut,
+                swapAmount,
+                minOut,
                 path,
                 to,
                 deadline
@@ -307,6 +346,258 @@ contract SonicSniperExecutor {
         amountOut = amounts[amounts.length - 1];
 
         emit Bought(router, address(0), tokenOut, amountIn, minAmountOut, to, block.number);
+    }
+
+    function sellV2(
+        address router,
+        address[] calldata path,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address recipient,
+        uint256 deadline,
+        address pair,
+        uint112 minBaseReserve,
+        uint112 minTokenReserve,
+        uint64 maxBlockNumber
+    ) external onlyOwner returns (uint256 amountOut) {
+        require(path.length >= 2, "BAD_PATH");
+
+        if (maxBlockNumber != 0) {
+            require(block.number <= maxBlockNumber, "BLOCK_GUARD");
+        }
+
+        if (pair != address(0)) {
+            (uint112 r0, uint112 r1,) = IUniswapV2Pair(pair).getReserves();
+            require(r0 >= minBaseReserve && r1 >= minTokenReserve, "RESERVE_GUARD");
+        }
+
+        address to = recipient == address(0) ? owner : recipient;
+        IERC20 tokenIn = IERC20(path[0]);
+
+        uint256 balance = tokenIn.balanceOf(address(this));
+        if (balance < amountIn) {
+            tokenIn.safeTransferFrom(owner, address(this), amountIn - balance);
+        }
+        uint256 swapAmount = tokenIn.balanceOf(address(this));
+        if (swapAmount > amountIn) {
+            swapAmount = amountIn;
+        }
+
+        uint256 minOut = minAmountOut;
+        if (useFeeOnTransfer && amountIn > 0 && swapAmount < amountIn) {
+            minOut = (minAmountOut * swapAmount) / amountIn;
+        }
+
+        tokenIn.safeApprove(router, 0);
+        tokenIn.safeApprove(router, useFeeOnTransfer ? swapAmount : amountIn);
+
+        if (useFeeOnTransfer) {
+            uint256 beforeBal = IERC20(path[path.length - 1]).balanceOf(to);
+            IUniswapV2Router02(router).swapExactTokensForTokensSupportingFeeOnTransferTokens(
+                swapAmount,
+                minOut,
+                path,
+                to,
+                deadline
+            );
+            uint256 afterBal = IERC20(path[path.length - 1]).balanceOf(to);
+            amountOut = afterBal - beforeBal;
+        } else {
+            uint256[] memory amounts = IUniswapV2Router02(router).swapExactTokensForTokens(
+                amountIn,
+                minAmountOut,
+                path,
+                to,
+                deadline
+            );
+            amountOut = amounts[amounts.length - 1];
+        }
+
+        tokenIn.safeApprove(router, 0);
+
+        emit Sold(
+            router,
+            path[0],
+            path[path.length - 1],
+            useFeeOnTransfer ? swapAmount : amountIn,
+            minOut,
+            to,
+            block.number
+        );
+    }
+
+    function sellV2ETH(
+        address router,
+        address[] calldata path,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address recipient,
+        uint256 deadline,
+        address pair,
+        uint112 minBaseReserve,
+        uint112 minTokenReserve,
+        uint64 maxBlockNumber
+    ) external onlyOwner returns (uint256 amountOut) {
+        require(path.length >= 2, "BAD_PATH");
+
+        if (maxBlockNumber != 0) {
+            require(block.number <= maxBlockNumber, "BLOCK_GUARD");
+        }
+
+        if (pair != address(0)) {
+            (uint112 r0, uint112 r1,) = IUniswapV2Pair(pair).getReserves();
+            require(r0 >= minBaseReserve && r1 >= minTokenReserve, "RESERVE_GUARD");
+        }
+
+        address to = recipient == address(0) ? owner : recipient;
+        IERC20 tokenIn = IERC20(path[0]);
+
+        uint256 balance = tokenIn.balanceOf(address(this));
+        if (balance < amountIn) {
+            tokenIn.safeTransferFrom(owner, address(this), amountIn - balance);
+        }
+        uint256 swapAmount = tokenIn.balanceOf(address(this));
+        if (swapAmount > amountIn) {
+            swapAmount = amountIn;
+        }
+
+        uint256 minOut = minAmountOut;
+        if (useFeeOnTransfer && amountIn > 0 && swapAmount < amountIn) {
+            minOut = (minAmountOut * swapAmount) / amountIn;
+        }
+
+        tokenIn.safeApprove(router, 0);
+        tokenIn.safeApprove(router, useFeeOnTransfer ? swapAmount : amountIn);
+
+        if (useFeeOnTransfer) {
+            uint256 beforeBal = to.balance;
+            IUniswapV2Router02(router).swapExactTokensForETHSupportingFeeOnTransferTokens(
+                swapAmount,
+                minOut,
+                path,
+                to,
+                deadline
+            );
+            uint256 afterBal = to.balance;
+            amountOut = afterBal - beforeBal;
+        } else {
+            uint256[] memory amounts = IUniswapV2Router02(router).swapExactTokensForETH(
+                amountIn,
+                minAmountOut,
+                path,
+                to,
+                deadline
+            );
+            amountOut = amounts[amounts.length - 1];
+        }
+
+        tokenIn.safeApprove(router, 0);
+
+        emit Sold(
+            router,
+            path[0],
+            address(0),
+            useFeeOnTransfer ? swapAmount : amountIn,
+            minOut,
+            to,
+            block.number
+        );
+    }
+
+    function sellSolidly(
+        address router,
+        address tokenIn,
+        address tokenOut,
+        bool stable,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address recipient,
+        uint256 deadline,
+        address pair,
+        uint112 minBaseReserve,
+        uint112 minTokenReserve,
+        uint64 maxBlockNumber
+    ) external onlyOwner returns (uint256 amountOut) {
+        if (maxBlockNumber != 0) {
+            require(block.number <= maxBlockNumber, "BLOCK_GUARD");
+        }
+
+        if (pair != address(0)) {
+            (uint112 r0, uint112 r1,) = IUniswapV2Pair(pair).getReserves();
+            require(r0 >= minBaseReserve && r1 >= minTokenReserve, "RESERVE_GUARD");
+        }
+
+        address to = recipient == address(0) ? owner : recipient;
+        IERC20 tokenInErc20 = IERC20(tokenIn);
+
+        uint256 balance = tokenInErc20.balanceOf(address(this));
+        if (balance < amountIn) {
+            tokenInErc20.safeTransferFrom(owner, address(this), amountIn - balance);
+        }
+
+        tokenInErc20.safeApprove(router, 0);
+        tokenInErc20.safeApprove(router, amountIn);
+
+        ISolidlyRouter.Route[] memory routes = new ISolidlyRouter.Route[](1);
+        routes[0] = ISolidlyRouter.Route({from: tokenIn, to: tokenOut, stable: stable});
+
+        uint256[] memory amounts =
+            ISolidlyRouter(router).swapExactTokensForTokens(amountIn, minAmountOut, routes, to, deadline);
+        amountOut = amounts[amounts.length - 1];
+
+        tokenInErc20.safeApprove(router, 0);
+
+        emit Sold(router, tokenIn, tokenOut, amountIn, minAmountOut, to, block.number);
+    }
+
+    function sellSolidlyETH(
+        address router,
+        address tokenIn,
+        address tokenOut,
+        bool stable,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address recipient,
+        uint256 deadline,
+        address pair,
+        uint112 minBaseReserve,
+        uint112 minTokenReserve,
+        uint64 maxBlockNumber
+    ) external onlyOwner returns (uint256 amountOut) {
+        if (maxBlockNumber != 0) {
+            require(block.number <= maxBlockNumber, "BLOCK_GUARD");
+        }
+
+        if (pair != address(0)) {
+            (uint112 r0, uint112 r1,) = IUniswapV2Pair(pair).getReserves();
+            require(r0 >= minBaseReserve && r1 >= minTokenReserve, "RESERVE_GUARD");
+        }
+
+        address to = recipient == address(0) ? owner : recipient;
+        IERC20 tokenInErc20 = IERC20(tokenIn);
+
+        uint256 balance = tokenInErc20.balanceOf(address(this));
+        if (balance < amountIn) {
+            tokenInErc20.safeTransferFrom(owner, address(this), amountIn - balance);
+        }
+
+        tokenInErc20.safeApprove(router, 0);
+        tokenInErc20.safeApprove(router, amountIn);
+
+        ISolidlyRouter.Route[] memory routes = new ISolidlyRouter.Route[](1);
+        routes[0] = ISolidlyRouter.Route({from: tokenIn, to: tokenOut, stable: stable});
+
+        uint256[] memory amounts =
+            ISolidlyRouter(router).swapExactTokensForTokens(amountIn, minAmountOut, routes, address(this), deadline);
+        amountOut = amounts[amounts.length - 1];
+
+        tokenInErc20.safeApprove(router, 0);
+
+        IWETH(tokenOut).withdraw(amountOut);
+        (bool ok,) = to.call{value: amountOut}("");
+        require(ok, "ETH_TRANSFER_FAILED");
+
+        emit Sold(router, tokenIn, address(0), amountIn, minAmountOut, to, block.number);
     }
 
     function rescueToken(address token, address to, uint256 amount) external onlyOwner {

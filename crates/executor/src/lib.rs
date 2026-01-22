@@ -10,4 +10,8 @@ pub use tx_builder::{
     BuyV2EthParams,
     BuyV2Params,
     ExecutorTxBuilder,
+    SellSolidlyEthParams,
+    SellSolidlyParams,
+    SellV2EthParams,
+    SellV2Params,
 };

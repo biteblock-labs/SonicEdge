@@ -60,8 +60,14 @@ just run
 
 - The bot is designed for local signing + raw sends; avoid RPC personal accounts.
 - Keep `SNIPER_PK` in a secure environment and avoid shell history leaks.
+- The CLI loads `.env` automatically; prefer an env file with `0600` permissions or a secrets manager (systemd `EnvironmentFile` works well).
+- Never store private keys in config files or logs.
 - The executor contract is `Ownable` and NOT upgradeable.
 - Approvals should be tight and reset to zero after use.
+
+## Contract Verification
+
+- Run `sniper deploy-contract` to print the canonical ABI hash and compare the configured executor's on-chain bytecode against `contracts/bytecode/SonicSniperExecutor.hex` when present.
 
 ## Limitations (v1)
 
@@ -76,10 +82,19 @@ just run
 - Set `dex.wrapped_native` to the wrapped native token (wS on Sonic) if you want native-base execution.
 - Use `dex.router_factories` to pin each router to its factory and avoid cross-DEX pair mismatches.
 - `dex.pair_cache_negative_ttl_ms` controls how quickly newly created pairs can be rediscovered after a miss.
+- `dex.sellability_recheck_interval_ms` periodically re-checks disabled routers (0 disables).
 - `dex.factory_pair_code_hashes` enables CREATE2 pair derivation when `getPair` misses (use factory `pairCodeHash` or known init code hash).
 - `dex.allow_execution_without_pair` lets you execute without a pair/reserve guard (unsafe; for ultra-aggressive snipes).
 - `dex.launch_only_liquidity_gate` filters out adds where the pair already had liquidity in the prior block.
 - `dex.launch_only_liquidity_gate_mode` (`strict`/`best_effort`) controls behavior when the gate can't be evaluated.
+- `strategy.position_store_path` persists open positions and exit signals across restarts.
+- `strategy.emergency_reserve_drop_bps` exits if pair reserves drop below the entry baseline by the given bps (0 disables).
+- `strategy.emergency_sell_sim_failures` exits after N consecutive sell simulation failures (0 disables).
+- `strategy.wait_for_mine` waits for the addLiquidity receipt before execution; tune `strategy.wait_for_mine_poll_interval_ms` and `strategy.wait_for_mine_timeout_ms`.
+- `strategy.same_block_attempt` attempts a pre-mine execution before waiting for the addLiquidity receipt; unresolved pairs still defer unless `dex.allow_execution_without_pair = true`.
+- `strategy.same_block_requires_reserves` requires non-zero pair reserves before same-block attempts (safer; defaults true).
+- `observability.log_format` controls log output format (`pretty` default, `json` for structured logs).
+- `sniper run` validates config (non-empty lists, address formats, bps bounds) and fails fast on invalid settings; it only warns (does not fail startup) if the private key env var or `executor.executor_contract` are missing (executions will be skipped).
 - `risk.sell_simulation_mode` (`strict`/`best_effort`) controls whether sell simulation must succeed; best-effort may skip tax checks on override or fee-on-transfer fallback.
 - `risk.sell_simulation_override_mode` (`detect`/`skip_any`) controls how override-related RPC errors are classified.
 - Some Solidly routers (e.g. SwapX RouterV2) do not expose `WETH()/weth()` getters; rely on docs/on-chain transfer traces for the wrapped base token and include wS `0x039e2fB66102314Ce7b64Ce5Ce3E5183bc94aD38` in `dex.base_tokens`.

@@ -1,6 +1,12 @@
 use alloy::sol;
 
 sol! {
+    struct Route {
+        address from;
+        address to;
+        bool stable;
+    }
+
     interface IUniswapV2Router02 {
         function addLiquidity(
             address tokenA,
@@ -84,6 +90,19 @@ sol! {
             address to,
             uint256 deadline
         ) external payable returns (uint256 amountToken, uint256 amountETH, uint256 liquidity);
+
+        function getAmountsOut(uint256 amountIn, Route[] calldata routes)
+            external
+            view
+            returns (uint256[] memory amounts);
+
+        function swapExactTokensForTokens(
+            uint256 amountIn,
+            uint256 amountOutMin,
+            Route[] calldata routes,
+            address to,
+            uint256 deadline
+        ) external returns (uint256[] memory amounts);
     }
 
     interface ISolidlyFactory {
