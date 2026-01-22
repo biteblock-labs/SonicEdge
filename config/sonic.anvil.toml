@@ -1,0 +1,91 @@
+[chain]
+chain_id = 146
+rpc_http = "http://127.0.0.1:9555"
+rpc_ws   = "ws://127.0.0.1:9555"
+
+[mempool]
+mode = "ws"
+txpool_poll_ms = 500
+fetch_concurrency = 256
+tx_fetch_timeout_ms = 150
+dedup_capacity = 100000
+dedup_ttl_ms = 60000
+ws_reconnect_base_ms = 500
+ws_reconnect_max_ms = 30000
+
+[dex]
+routers = [
+  "0x1D368773735ee1E678950B7A97bcA2CafB330CDc", # Shadow Router
+  "0xF5F7231073b3B41c04BA655e1a7438b1a7b29c27", # SwapX RouterV2
+]
+factories = [
+  "0x2dA25E7446A70D7be65fd4c053948BEcAA6374c8", # Shadow Factory
+  "0x05c1be79d3aC21Cc4B727eeD58C9B2fF757F5663", # SwapX PairFactoryUpgradeable
+]
+router_factories = [
+  { router = "0x1D368773735ee1E678950B7A97bcA2CafB330CDc", factory = "0x2dA25E7446A70D7be65fd4c053948BEcAA6374c8" },
+  { router = "0xF5F7231073b3B41c04BA655e1a7438b1a7b29c27", factory = "0x05c1be79d3aC21Cc4B727eeD58C9B2fF757F5663" },
+]
+factory_pair_code_hashes = [
+  { factory = "0x2dA25E7446A70D7be65fd4c053948BEcAA6374c8", pair_code_hash = "0x4ed7aeec7c0286cad1e282dee1c391719fc17fe923b04fb0775731e413ed3554" },
+  { factory = "0x05c1be79d3aC21Cc4B727eeD58C9B2fF757F5663", pair_code_hash = "0x6c45999f36731ff6ab43e943fca4b5a700786bbb202116cf6633b32039161e05" },
+]
+wrapped_native = "0x039e2fB66102314Ce7b64Ce5Ce3E5183bc94aD38"
+base_tokens = [
+  "0x0000000000000000000000000000000000000000", # native
+  "0x039e2fB66102314Ce7b64Ce5Ce3E5183bc94aD38", # wS
+  "0x50c42dEAcD8Fc9773493ED674b675bE577f2634b", # WETH
+  "0x29219dd400f2Bf60E5a23d13Be72B486D4038894", # USDC
+]
+pair_cache_capacity = 2048
+pair_cache_ttl_ms = 300000
+pair_cache_negative_ttl_ms = 15000
+sellability_recheck_interval_ms = 60000
+allow_execution_without_pair = false
+launch_only_liquidity_gate = true
+launch_only_liquidity_gate_mode = "strict"
+min_base_amount = "1000"
+max_slippage_bps = 300
+deadline_secs = 20
+
+[risk]
+sellability_amount_base = "10"
+max_tax_bps = 1500
+erc20_call_timeout_ms = 120
+sell_simulation_mode = "best_effort"
+sell_simulation_override_mode = "detect"
+
+[executor]
+owner_private_key_env = "SNIPER_PK"
+executor_contract = "0x0000000000000000000000000000000000000000"
+gas_mode = "eip1559"
+max_fee_gwei = 200
+max_priority_gwei = 50
+bump_pct = 15
+bump_interval_ms = 800
+nonce_sync_interval_ms = 10000
+receipt_poll_interval_ms = 2000
+receipt_timeout_ms = 120000
+max_block_number_delta = 1
+
+[strategy]
+take_profit_bps = 3000
+stop_loss_bps = 1500
+max_hold_secs = 900
+exit_signal_ttl_secs = 3600
+emergency_reserve_drop_bps = 0
+emergency_sell_sim_failures = 0
+position_store_path = "state/positions.json"
+wait_for_mine = true
+same_block_attempt = true
+same_block_requires_reserves = true
+wait_for_mine_poll_interval_ms = 500
+wait_for_mine_timeout_ms = 60000
+candidate_cache_capacity = 10000
+candidate_ttl_ms = 300000
+
+[observability]
+metrics_enabled = true
+metrics_bind = "0.0.0.0:9102"
+log_level = "info"
+log_format = "pretty"

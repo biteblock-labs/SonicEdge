@@ -62,6 +62,17 @@ SNIPER_PK=0x<hex_private_key>
 - If you need Solidly/native execution, redeploy after updating the ABI to include `buySolidly`/`buySolidlyETH`/`buyV2ETH`.
 - Run `sniper deploy-contract` to print the canonical ABI hash and verify the configured executor address bytecode against `contracts/bytecode/SonicSniperExecutor.hex` when available.
 
+## Local Fork Pipeline Test
+- Run an anvil fork on a different port than the full node (example uses `9555`) and keep chain id `146`:
+
+```
+anvil --fork-url http://127.0.0.1:8545 --port 9555 --chain-id 146
+```
+
+- Use `config/sonic.anvil.toml` so both HTTP/WS point at `ws://127.0.0.1:9555`.
+- Keep `mempool.mode = "ws"` on the fork (anvil does not support `txpool_content`).
+- Deploy the executor on the fork, fund the hot wallet, and run the bot with the anvil config to exercise the full flow.
+
 ## Run
 ```
 just run
