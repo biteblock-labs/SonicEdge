@@ -295,15 +295,26 @@ contract SonicSniperExecutor {
         if (balance < amountIn) {
             tokenInErc20.safeTransferFrom(owner, address(this), amountIn - balance);
         }
+        uint256 swapAmount = tokenInErc20.balanceOf(address(this));
+        if (swapAmount > amountIn) {
+            swapAmount = amountIn;
+        }
+
+        uint256 minOut = minAmountOut;
+        if (useFeeOnTransfer && amountIn > 0 && swapAmount < amountIn) {
+            minOut = (minAmountOut * swapAmount) / amountIn;
+        }
+
+        uint256 effectiveAmountIn = useFeeOnTransfer ? swapAmount : amountIn;
 
         tokenInErc20.safeApprove(router, 0);
-        tokenInErc20.safeApprove(router, amountIn);
+        tokenInErc20.safeApprove(router, effectiveAmountIn);
 
         ISolidlyRouter.Route[] memory routes = new ISolidlyRouter.Route[](1);
         routes[0] = ISolidlyRouter.Route({from: tokenIn, to: tokenOut, stable: stable});
 
         uint256[] memory amounts =
-            ISolidlyRouter(router).swapExactTokensForTokens(amountIn, minAmountOut, routes, to, deadline);
+            ISolidlyRouter(router).swapExactTokensForTokens(effectiveAmountIn, minOut, routes, to, deadline);
         amountOut = amounts[amounts.length - 1];
 
         tokenInErc20.safeApprove(router, 0);
@@ -534,20 +545,39 @@ contract SonicSniperExecutor {
         if (balance < amountIn) {
             tokenInErc20.safeTransferFrom(owner, address(this), amountIn - balance);
         }
+        uint256 swapAmount = tokenInErc20.balanceOf(address(this));
+        if (swapAmount > amountIn) {
+            swapAmount = amountIn;
+        }
+
+        uint256 minOut = minAmountOut;
+        if (useFeeOnTransfer && amountIn > 0 && swapAmount < amountIn) {
+            minOut = (minAmountOut * swapAmount) / amountIn;
+        }
+
+        uint256 effectiveAmountIn = useFeeOnTransfer ? swapAmount : amountIn;
 
         tokenInErc20.safeApprove(router, 0);
-        tokenInErc20.safeApprove(router, amountIn);
+        tokenInErc20.safeApprove(router, effectiveAmountIn);
 
         ISolidlyRouter.Route[] memory routes = new ISolidlyRouter.Route[](1);
         routes[0] = ISolidlyRouter.Route({from: tokenIn, to: tokenOut, stable: stable});
 
         uint256[] memory amounts =
-            ISolidlyRouter(router).swapExactTokensForTokens(amountIn, minAmountOut, routes, to, deadline);
+            ISolidlyRouter(router).swapExactTokensForTokens(effectiveAmountIn, minOut, routes, to, deadline);
         amountOut = amounts[amounts.length - 1];
 
         tokenInErc20.safeApprove(router, 0);
 
-        emit Sold(router, tokenIn, tokenOut, amountIn, minAmountOut, to, block.number);
+        emit Sold(
+            router,
+            tokenIn,
+            tokenOut,
+            useFeeOnTransfer ? swapAmount : amountIn,
+            minOut,
+            to,
+            block.number
+        );
     }
 
     function sellSolidlyETH(
@@ -580,15 +610,26 @@ contract SonicSniperExecutor {
         if (balance < amountIn) {
             tokenInErc20.safeTransferFrom(owner, address(this), amountIn - balance);
         }
+        uint256 swapAmount = tokenInErc20.balanceOf(address(this));
+        if (swapAmount > amountIn) {
+            swapAmount = amountIn;
+        }
+
+        uint256 minOut = minAmountOut;
+        if (useFeeOnTransfer && amountIn > 0 && swapAmount < amountIn) {
+            minOut = (minAmountOut * swapAmount) / amountIn;
+        }
+
+        uint256 effectiveAmountIn = useFeeOnTransfer ? swapAmount : amountIn;
 
         tokenInErc20.safeApprove(router, 0);
-        tokenInErc20.safeApprove(router, amountIn);
+        tokenInErc20.safeApprove(router, effectiveAmountIn);
 
         ISolidlyRouter.Route[] memory routes = new ISolidlyRouter.Route[](1);
         routes[0] = ISolidlyRouter.Route({from: tokenIn, to: tokenOut, stable: stable});
 
         uint256[] memory amounts =
-            ISolidlyRouter(router).swapExactTokensForTokens(amountIn, minAmountOut, routes, address(this), deadline);
+            ISolidlyRouter(router).swapExactTokensForTokens(effectiveAmountIn, minOut, routes, address(this), deadline);
         amountOut = amounts[amounts.length - 1];
 
         tokenInErc20.safeApprove(router, 0);
@@ -597,7 +638,15 @@ contract SonicSniperExecutor {
         (bool ok,) = to.call{value: amountOut}("");
         require(ok, "ETH_TRANSFER_FAILED");
 
-        emit Sold(router, tokenIn, address(0), amountIn, minAmountOut, to, block.number);
+        emit Sold(
+            router,
+            tokenIn,
+            address(0),
+            useFeeOnTransfer ? swapAmount : amountIn,
+            minOut,
+            to,
+            block.number
+        );
     }
 
     function rescueToken(address token, address to, uint256 amount) external onlyOwner {

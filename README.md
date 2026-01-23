@@ -69,6 +69,11 @@ just run
 
 - Run `sniper deploy-contract` to print the canonical ABI hash and compare the configured executor's on-chain bytecode against `contracts/bytecode/SonicSniperExecutor.hex` when present.
 
+## Testing (Anvil)
+
+- For deterministic risk-path coverage, use a small “token zoo” on an anvil fork (standard ERC20, fee-on-transfer, honeypot/blacklist, bad metadata, non-standard storage). See `docs/ops-runbook.md` for the full checklist and recommended risk settings.
+- Anvil is the chosen full-pipeline verification approach before mainnet runs.
+
 ## Limitations (v1)
 
 - No bundle relay integration (public mempool only).

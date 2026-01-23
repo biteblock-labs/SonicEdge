@@ -87,6 +87,15 @@ pub struct RiskConfig {
     pub sell_simulation_mode: String,
     #[serde(default = "default_sell_simulation_override_mode")]
     pub sell_simulation_override_mode: String,
+    #[serde(default)]
+    pub token_override_slots: Vec<TokenOverrideSlotsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenOverrideSlotsConfig {
+    pub token: String,
+    pub balance_slot: u64,
+    pub allowance_slot: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +103,8 @@ pub struct ExecutorConfig {
     pub owner_private_key_env: String,
     pub executor_contract: String,
     pub gas_mode: String,
+    #[serde(default = "default_auto_approve_mode")]
+    pub auto_approve_mode: String,
     pub max_fee_gwei: u64,
     pub max_priority_gwei: u64,
     pub bump_pct: u32,
@@ -211,10 +222,24 @@ impl AppConfig {
         ensure_max_bps("risk.max_tax_bps", self.risk.max_tax_bps)?;
         ensure_valid_sell_simulation_mode(&self.risk.sell_simulation_mode)?;
         ensure_valid_sell_simulation_override_mode(&self.risk.sell_simulation_override_mode)?;
+        let mut override_tokens = HashSet::new();
+        for entry in &self.risk.token_override_slots {
+            ensure_non_empty("risk.token_override_slots.token", &entry.token)?;
+            let token = parse_address(entry.token.trim())?;
+            if token == Address::ZERO {
+                bail_config!("risk.token_override_slots token must not be zero");
+            }
+            if !override_tokens.insert(token) {
+                bail_config!(
+                    "risk.token_override_slots token {token:?} appears more than once"
+                );
+            }
+        }
 
         ensure_non_empty("executor.owner_private_key_env", &self.executor.owner_private_key_env)?;
         let _ = parse_address(self.executor.executor_contract.trim())?;
         ensure_valid_gas_mode(&self.executor.gas_mode)?;
+        ensure_valid_auto_approve_mode(&self.executor.auto_approve_mode)?;
 
         ensure_max_bps("strategy.take_profit_bps", self.strategy.take_profit_bps)?;
         ensure_max_bps("strategy.stop_loss_bps", self.strategy.stop_loss_bps)?;
@@ -325,6 +350,14 @@ fn ensure_valid_gas_mode(value: &str) -> Result<()> {
     }
 }
 
+fn ensure_valid_auto_approve_mode(value: &str) -> Result<()> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "off" | "exact" | "max" => Ok(()),
+        _ => bail_config!("unsupported executor.auto_approve_mode: {value}"),
+    }
+}
+
 fn ensure_valid_sell_simulation_mode(value: &str) -> Result<()> {
     let normalized = value.trim().to_ascii_lowercase();
     match normalized.as_str() {
@@ -351,6 +384,10 @@ fn ensure_valid_log_format(value: &str) -> Result<()> {
 
 fn default_pair_cache_capacity() -> usize {
     2048
+}
+
+fn default_auto_approve_mode() -> String {
+    "off".to_string()
 }
 
 fn default_sell_simulation_mode() -> String {

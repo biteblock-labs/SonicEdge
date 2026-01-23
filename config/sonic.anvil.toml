@@ -42,23 +42,27 @@ pair_cache_ttl_ms = 300000
 pair_cache_negative_ttl_ms = 15000
 sellability_recheck_interval_ms = 60000
 allow_execution_without_pair = false
-launch_only_liquidity_gate = true
+launch_only_liquidity_gate = false
 launch_only_liquidity_gate_mode = "strict"
 min_base_amount = "1000"
 max_slippage_bps = 300
 deadline_secs = 20
 
 [risk]
-sellability_amount_base = "10"
+sellability_amount_base = "1000000000000000"
 max_tax_bps = 1500
 erc20_call_timeout_ms = 120
 sell_simulation_mode = "best_effort"
 sell_simulation_override_mode = "detect"
+token_override_slots = [
+  { token = "0x29219dd400f2Bf60E5a23d13Be72B486D4038894", balance_slot = 9, allowance_slot = 10 },
+]
 
 [executor]
 owner_private_key_env = "SNIPER_PK"
-executor_contract = "0x0000000000000000000000000000000000000000"
+executor_contract = "0xb7f8bc63bbcad18155201308c8f3540b07f84f5e"
 gas_mode = "eip1559"
+auto_approve_mode = "exact"
 max_fee_gwei = 200
 max_priority_gwei = 50
 bump_pct = 15
@@ -77,7 +81,7 @@ emergency_reserve_drop_bps = 0
 emergency_sell_sim_failures = 0
 position_store_path = "state/positions.json"
 wait_for_mine = true
-same_block_attempt = true
+same_block_attempt = false
 same_block_requires_reserves = true
 wait_for_mine_poll_interval_ms = 500
 wait_for_mine_timeout_ms = 60000

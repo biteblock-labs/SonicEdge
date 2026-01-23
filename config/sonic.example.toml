@@ -32,16 +32,18 @@ max_slippage_bps = 300
 deadline_secs = 20
 
 [risk]
-sellability_amount_base = "10"
+sellability_amount_base = "1000000000000000"
 max_tax_bps = 1500
 erc20_call_timeout_ms = 120
 sell_simulation_mode = "best_effort"
 sell_simulation_override_mode = "detect"
+token_override_slots = []
 
 [executor]
 owner_private_key_env = "SNIPER_PK"
 executor_contract = "0x0000000000000000000000000000000000000000"
 gas_mode = "eip1559"
+auto_approve_mode = "off"
 max_fee_gwei = 200
 max_priority_gwei = 50
 bump_pct = 15

@@ -74,9 +74,10 @@ Developer roadmap with checklist items aligned to the original scope.
 - [x] Config validation on startup (required fields + bounds)
 - [x] CLI command: `sniper deploy-contract` verify address + ABI hash
 - [ ] Replay harness with richer sample dataset
-- [ ] Decide and document full-pipeline verification approach (replay harness vs anvil) with acceptance criteria
+- [x] Decide and document full-pipeline verification approach (anvil fork) with acceptance criteria
 - [ ] Integration tests with local sonic devnet
 - [ ] End-to-end pipeline smoke test harness on anvil/local chain (liquidity add → execution → exits → restart)
+- [ ] Token zoo risk harness on anvil (standard/FOT/honeypot/bad metadata/non-standard storage) + one-command runner
 - [ ] Telegram notifier for alerts and visibility (candidates, risk rejects, executions, PnL snapshots)
 - [ ] Optional Telegram control commands (restricted allowlist + audit log)
 

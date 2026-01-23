@@ -73,6 +73,19 @@ const SIMULATION_DEADLINE_SECS: u64 = 10_000_000_000;
 const SIMULATION_SENDER: Address = address!("0x1111111111111111111111111111111111111111");
 const VERIFY_AMOUNT_IN: u64 = 1_000_000_000_000_000_000;
 
+#[derive(Clone, Copy)]
+struct TokenOverrideSlots {
+    balance_slot: u64,
+    allowance_slot: u64,
+}
+
+impl TokenOverrideSlots {
+    const DEFAULT: Self = Self {
+        balance_slot: ERC20_BALANCES_SLOT,
+        allowance_slot: ERC20_ALLOWANCES_SLOT,
+    };
+}
+
 enum ExecutionOutcome {
     Sent { hash: B256, tx: TransactionRequest },
     Skipped(&'static str, DropKind),
@@ -103,6 +116,25 @@ impl LaunchGateMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoApproveMode {
+    Off,
+    Exact,
+    Max,
+}
+
+impl AutoApproveMode {
+    fn parse(raw: &str) -> Result<Self> {
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "off" => Ok(Self::Off),
+            "exact" => Ok(Self::Exact),
+            "max" => Ok(Self::Max),
+            _ => bail!("unsupported executor.auto_approve_mode: {raw}"),
+        }
+    }
+}
+
 pub struct Bot {
     cfg: AppConfig,
     chain: NodeClient,
@@ -122,6 +154,7 @@ pub struct Bot {
     sender: TxSender,
     min_base_amount: U256,
     launch_gate_mode: LaunchGateMode,
+    auto_approve_mode: AutoApproveMode,
     pending_liquidity: HashMap<B256, PendingLiquidity>,
     pending_receipts: HashMap<B256, PendingReceipt>,
     pending_exits: HashMap<B256, PendingExit>,
@@ -132,6 +165,7 @@ pub struct Bot {
     candidate_store: CandidateStore,
     positions: PositionStore,
     position_store_path: Option<PathBuf>,
+    token_override_slots: HashMap<Address, TokenOverrideSlots>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -336,6 +370,19 @@ impl Bot {
         let min_base_amount = parse_u256_decimal(&cfg.dex.min_base_amount)?;
         let launch_gate_mode =
             LaunchGateMode::parse(&cfg.dex.launch_only_liquidity_gate_mode)?;
+        let auto_approve_mode =
+            AutoApproveMode::parse(&cfg.executor.auto_approve_mode)?;
+        let mut token_override_slots = HashMap::new();
+        for entry in &cfg.risk.token_override_slots {
+            let token = parse_address(entry.token.trim())?;
+            token_override_slots.insert(
+                token,
+                TokenOverrideSlots {
+                    balance_slot: entry.balance_slot,
+                    allowance_slot: entry.allowance_slot,
+                },
+            );
+        }
         let risk = RiskEngine::new(cfg.risk.clone())?;
         let pair_cache = PairMetadataCache::new(
             cfg.dex.pair_cache_capacity,
@@ -443,6 +490,7 @@ impl Bot {
             sender,
             min_base_amount,
             launch_gate_mode,
+            auto_approve_mode,
             pending_liquidity: HashMap::new(),
             pending_receipts: HashMap::new(),
             pending_exits,
@@ -453,6 +501,7 @@ impl Bot {
             candidate_store,
             positions,
             position_store_path,
+            token_override_slots,
         })
     }
 
@@ -1516,9 +1565,26 @@ impl Bot {
             ));
         }
 
-        let nonce = self.nonce.next_nonce();
         let deadline = U256::from(now_ms() / 1000 + self.cfg.dex.deadline_secs as u64);
         let max_block_number = self.resolve_max_block_number().await?;
+        if candidate.base != Address::ZERO {
+            if let Err(err) = self
+                .ensure_base_token_approval(candidate.base, candidate.implied_liquidity)
+                .await
+            {
+                warn!(
+                    ?err,
+                    token = %candidate.base,
+                    "auto-approve failed; skipping execution"
+                );
+                return Ok(ExecutionOutcome::Skipped(
+                    "auto-approve failed",
+                    DropKind::Transient,
+                ));
+            }
+        }
+        let nonce = self.nonce.next_nonce();
+        let buy_recipient = self.tx_builder.contract;
 
         let tx = if candidate.base == Address::ZERO {
             let wrapped_native = match self.wrapped_native {
@@ -1539,7 +1605,7 @@ impl Bot {
                     stable,
                     amount_in: candidate.implied_liquidity,
                     min_amount_out: U256::from(0u64),
-                    recipient: self.tx_builder.owner,
+                    recipient: buy_recipient,
                     deadline,
                     pair: candidate.pair.unwrap_or(Address::ZERO),
                     min_base_reserve: 0u128,
@@ -1553,7 +1619,7 @@ impl Bot {
                     path: vec![wrapped_native, candidate.token],
                     amount_in: candidate.implied_liquidity,
                     min_amount_out: U256::from(0u64),
-                    recipient: self.tx_builder.owner,
+                    recipient: buy_recipient,
                     deadline,
                     pair: candidate.pair.unwrap_or(Address::ZERO),
                     min_base_reserve: 0u128,
@@ -1570,7 +1636,7 @@ impl Bot {
                 stable,
                 amount_in: candidate.implied_liquidity,
                 min_amount_out: U256::from(0u64),
-                recipient: self.tx_builder.owner,
+                recipient: buy_recipient,
                 deadline,
                 pair: candidate.pair.unwrap_or(Address::ZERO),
                 min_base_reserve: 0u128,
@@ -1584,7 +1650,7 @@ impl Bot {
                 path: vec![candidate.base, candidate.token],
                 amount_in: candidate.implied_liquidity,
                 min_amount_out: U256::from(0u64),
-                recipient: self.tx_builder.owner,
+                recipient: buy_recipient,
                 deadline,
                 pair: candidate.pair.unwrap_or(Address::ZERO),
                 min_base_reserve: 0u128,
@@ -1981,27 +2047,38 @@ impl Bot {
         if self.tx_builder.owner == Address::ZERO {
             return Ok(estimate);
         }
-        match self
-            .token_balance(position.token, self.tx_builder.owner)
-            .await
-        {
-            Ok(balance) => {
-                if balance.is_zero() {
-                    return Ok(None);
-                }
-                let amount = if let Some(estimate) = estimate {
-                    if balance < estimate {
-                        balance
-                    } else {
-                        estimate
-                    }
+        let contract_balance = self
+            .token_balance(position.token, self.tx_builder.contract)
+            .await?;
+        if !contract_balance.is_zero() {
+            let amount = if let Some(estimate) = estimate {
+                if contract_balance < estimate {
+                    contract_balance
                 } else {
-                    balance
-                };
-                Ok(Some(amount))
-            }
-            Err(err) => Err(err),
+                    estimate
+                }
+            } else {
+                contract_balance
+            };
+            return Ok(Some(amount));
         }
+
+        let owner_balance = self
+            .token_balance(position.token, self.tx_builder.owner)
+            .await?;
+        if owner_balance.is_zero() {
+            return Ok(None);
+        }
+        let amount = if let Some(estimate) = estimate {
+            if owner_balance < estimate {
+                owner_balance
+            } else {
+                estimate
+            }
+        } else {
+            owner_balance
+        };
+        Ok(Some(amount))
     }
 
     async fn exit_min_amount_out(
@@ -2069,6 +2146,81 @@ impl Bot {
         let data = self.chain.http.call(tx).await?;
         let balance = IERC20::balanceOfCall::abi_decode_returns(&data)?;
         Ok(balance)
+    }
+
+    async fn token_allowance(
+        &self,
+        token: Address,
+        owner: Address,
+        spender: Address,
+    ) -> Result<U256> {
+        let call = IERC20::allowanceCall { owner, spender };
+        let tx = TransactionRequest {
+            to: Some(TxKind::Call(token)),
+            input: TransactionInput::new(call.abi_encode().into()),
+            ..Default::default()
+        };
+        let data = self.chain.http.call(tx).await?;
+        let allowance = IERC20::allowanceCall::abi_decode_returns(&data)?;
+        Ok(allowance)
+    }
+
+    async fn ensure_base_token_approval(
+        &self,
+        token: Address,
+        amount_in: U256,
+    ) -> Result<()> {
+        if self.auto_approve_mode == AutoApproveMode::Off {
+            return Ok(());
+        }
+        if token == Address::ZERO || amount_in.is_zero() {
+            return Ok(());
+        }
+        if self.tx_builder.owner == Address::ZERO {
+            return Ok(());
+        }
+        if self.tx_builder.contract == Address::ZERO {
+            return Ok(());
+        }
+        let allowance = self
+            .token_allowance(token, self.tx_builder.owner, self.tx_builder.contract)
+            .await?;
+        if allowance >= amount_in {
+            return Ok(());
+        }
+        let approve_amount = match self.auto_approve_mode {
+            AutoApproveMode::Exact => amount_in,
+            AutoApproveMode::Max => U256::MAX,
+            AutoApproveMode::Off => return Ok(()),
+        };
+        if allowance > U256::ZERO {
+            let hash = self.send_token_approve(token, U256::ZERO).await?;
+            info!(%hash, token = %token, "auto-approve reset sent");
+        }
+        let hash = self.send_token_approve(token, approve_amount).await?;
+        info!(%hash, token = %token, "auto-approve sent");
+        Ok(())
+    }
+
+    async fn send_token_approve(
+        &self,
+        token: Address,
+        amount: U256,
+    ) -> Result<B256> {
+        let call = IERC20::approveCall {
+            spender: self.tx_builder.contract,
+            amount,
+        };
+        let mut tx = TransactionRequest {
+            from: Some(self.tx_builder.owner),
+            to: Some(TxKind::Call(token)),
+            input: TransactionInput::new(call.abi_encode().into()),
+            nonce: Some(self.nonce.next_nonce()),
+            chain_id: Some(self.tx_builder.chain_id),
+            ..Default::default()
+        };
+        self.tx_builder.fees.apply(&mut tx);
+        self.sender.send(tx).await
     }
 
     async fn record_position(
@@ -2405,6 +2557,13 @@ impl Bot {
         }
     }
 
+    fn override_slots(&self, token: Address) -> TokenOverrideSlots {
+        self.token_override_slots
+            .get(&token)
+            .copied()
+            .unwrap_or(TokenOverrideSlots::DEFAULT)
+    }
+
     async fn quote_v2_swap_amount_out(
         &self,
         router: Address,
@@ -2427,7 +2586,9 @@ impl Bot {
             input: TransactionInput::new(call.abi_encode().into()),
             ..Default::default()
         };
-        let overrides = simulation_overrides(token_in, SIMULATION_SENDER, router, amount_in);
+        let slots = self.override_slots(token_in);
+        let overrides =
+            simulation_overrides(token_in, SIMULATION_SENDER, router, amount_in, slots);
         let call = match block {
             Some(block_number) => self
                 .chain
@@ -2521,7 +2682,9 @@ impl Bot {
             input: TransactionInput::new(call.abi_encode().into()),
             ..Default::default()
         };
-        let overrides = simulation_overrides(token_in, SIMULATION_SENDER, router, amount_in);
+        let slots = self.override_slots(token_in);
+        let overrides =
+            simulation_overrides(token_in, SIMULATION_SENDER, router, amount_in, slots);
         let call = match block {
             Some(block_number) => self
                 .chain
@@ -3547,9 +3710,10 @@ fn simulation_overrides(
     owner: Address,
     spender: Address,
     amount_in: U256,
+    slots: TokenOverrideSlots,
 ) -> StateOverride {
-    let balance_slot = mapping_slot(owner, ERC20_BALANCES_SLOT);
-    let allowance_slot = double_mapping_slot(owner, spender, ERC20_ALLOWANCES_SLOT);
+    let balance_slot = mapping_slot(owner, slots.balance_slot);
+    let allowance_slot = double_mapping_slot(owner, spender, slots.allowance_slot);
     StateOverridesBuilder::default()
         .append(
             token,
@@ -3580,7 +3744,7 @@ fn double_mapping_slot(owner: Address, spender: Address, slot: u64) -> B256 {
 mod tests {
     use super::*;
     use crate::state::{ExitReason, Position, PositionStatus};
-    use alloy::primitives::{address, Bytes, Uint, B256, U256};
+    use alloy::primitives::{address, Bytes, Uint, B256, U256, U64};
     use alloy::providers::{Provider, ProviderBuilder};
     use alloy::rpc::types::TransactionReceipt;
     use alloy::rpc::types::TransactionRequest;
@@ -3646,11 +3810,13 @@ mod tests {
                 erc20_call_timeout_ms: 0,
                 sell_simulation_mode: "best_effort".to_string(),
                 sell_simulation_override_mode: "detect".to_string(),
+                token_override_slots: Vec::new(),
             },
             executor: ExecutorConfig {
                 owner_private_key_env: "SNIPER_PK".to_string(),
                 executor_contract: "0x0000000000000000000000000000000000000000".to_string(),
                 gas_mode: "eip1559".to_string(),
+                auto_approve_mode: "off".to_string(),
                 max_fee_gwei: 0,
                 max_priority_gwei: 0,
                 bump_pct: 0,
@@ -3704,8 +3870,20 @@ mod tests {
                 max_priority_gwei: 0,
             },
         );
+        let mut token_override_slots = HashMap::new();
+        for entry in &cfg.risk.token_override_slots {
+            let token = parse_address(entry.token.trim()).unwrap();
+            token_override_slots.insert(
+                token,
+                TokenOverrideSlots {
+                    balance_slot: entry.balance_slot,
+                    allowance_slot: entry.allowance_slot,
+                },
+            );
+        }
         Bot {
             launch_gate_mode: LaunchGateMode::parse(&cfg.dex.launch_only_liquidity_gate_mode).unwrap(),
+            auto_approve_mode: AutoApproveMode::parse(&cfg.executor.auto_approve_mode).unwrap(),
             cfg,
             chain,
             routers: HashSet::new(),
@@ -3733,6 +3911,7 @@ mod tests {
             candidate_store: CandidateStore::new(1, 0),
             positions: PositionStore::new(),
             position_store_path: None,
+            token_override_slots,
         }
     }
 
@@ -3771,6 +3950,31 @@ mod tests {
             status: PositionStatus::Open,
             exit_tx_hash: None,
         }
+    }
+
+    #[test]
+    fn simulation_overrides_use_custom_slots() {
+        let token = address!("0x1000000000000000000000000000000000000001");
+        let owner = address!("0x2000000000000000000000000000000000000002");
+        let spender = address!("0x3000000000000000000000000000000000000003");
+        let amount = U256::from(123u64);
+        let slots = TokenOverrideSlots {
+            balance_slot: 9,
+            allowance_slot: 10,
+        };
+
+        let overrides = simulation_overrides(token, owner, spender, amount, slots);
+        let account = overrides.get(&token).expect("missing token override");
+        let state_diff = account.state_diff.as_ref().expect("missing state diff");
+        let balance_key = mapping_slot(owner, slots.balance_slot);
+        let allowance_key = double_mapping_slot(owner, spender, slots.allowance_slot);
+
+        assert_eq!(state_diff.get(&balance_key), Some(&B256::from(amount)));
+        assert_eq!(
+            state_diff.get(&allowance_key),
+            Some(&B256::from(U256::MAX))
+        );
+        assert_eq!(state_diff.len(), 2);
     }
 
     #[tokio::test]
@@ -4304,6 +4508,90 @@ mod tests {
 
         let max_block = bot.resolve_max_block_number().await.unwrap();
         assert_eq!(max_block, 101);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_approve_off_skips_calls() {
+        let asserter = Asserter::new();
+        let cfg = test_config(true, "strict");
+        let mut bot = build_bot(cfg, &asserter, Vec::new());
+        bot.tx_builder.owner = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        bot.tx_builder.contract = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        bot.ensure_base_token_approval(
+            address!("0x3000000000000000000000000000000000000003"),
+            U256::from(10u64),
+        )
+        .await
+        .unwrap();
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_approve_exact_resets_when_allowance_nonzero() {
+        let asserter = Asserter::new();
+        let mut cfg = test_config(true, "strict");
+        cfg.executor.auto_approve_mode = "exact".to_string();
+        let mut bot = build_bot(cfg, &asserter, Vec::new());
+        bot.tx_builder.owner = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        bot.tx_builder.contract = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        let allowance = U256::from(1u64);
+        asserter.push_success(&Bytes::from(
+            IERC20::allowanceCall::abi_encode_returns(&allowance),
+        ));
+        asserter.push_success(&U64::from(50_000u64));
+        asserter.push_success(&B256::from([1u8; 32]));
+        asserter.push_success(&U64::from(50_000u64));
+        asserter.push_success(&B256::from([2u8; 32]));
+
+        bot.ensure_base_token_approval(
+            address!("0x3000000000000000000000000000000000000003"),
+            U256::from(10u64),
+        )
+        .await
+        .unwrap();
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_approve_max_sends_single_approve_on_zero_allowance() {
+        let asserter = Asserter::new();
+        let mut cfg = test_config(true, "strict");
+        cfg.executor.auto_approve_mode = "max".to_string();
+        let mut bot = build_bot(cfg, &asserter, Vec::new());
+        bot.tx_builder.owner = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        bot.tx_builder.contract = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        let allowance = U256::ZERO;
+        asserter.push_success(&Bytes::from(
+            IERC20::allowanceCall::abi_encode_returns(&allowance),
+        ));
+        asserter.push_success(&U64::from(50_000u64));
+        asserter.push_success(&B256::from([3u8; 32]));
+
+        bot.ensure_base_token_approval(
+            address!("0x3000000000000000000000000000000000000003"),
+            U256::from(10u64),
+        )
+        .await
+        .unwrap();
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_approve_skips_native_token() {
+        let asserter = Asserter::new();
+        let mut cfg = test_config(true, "strict");
+        cfg.executor.auto_approve_mode = "exact".to_string();
+        let mut bot = build_bot(cfg, &asserter, Vec::new());
+        bot.tx_builder.owner = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        bot.tx_builder.contract = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        bot.ensure_base_token_approval(Address::ZERO, U256::from(10u64))
+            .await
+            .unwrap();
         assert!(asserter.read_q().is_empty());
     }
 }

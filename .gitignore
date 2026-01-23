@@ -1,6 +1,7 @@
 # Build outputs
 /target/
 /target-codex/
+/cache/
 
 # Local config with RPC keys
 /config/sonic.alchemy.toml

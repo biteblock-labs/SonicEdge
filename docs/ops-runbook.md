@@ -45,6 +45,7 @@ geth \
 - `sniper run` validates required lists, address formats, and bps bounds (invalid config fails fast); it only warns (does not fail startup) if the private key env var or `executor.executor_contract` are missing (executions will be skipped).
 - Keep `min_base_amount` in raw base units.
 - Set `risk.sell_simulation_mode` (`strict`/`best_effort`) and `risk.sell_simulation_override_mode` (`detect`/`skip_any`) to tune sell simulation enforcement.
+- Use `risk.token_override_slots` to define non-standard ERC20 storage layouts (balance/allowance slots) so sell simulation and quote overrides work on tokens like USDC.
 
 ## Secrets
 - Create a `.env` file and set the hot wallet key:
@@ -58,9 +59,12 @@ SNIPER_PK=0x<hex_private_key>
 ## Deploy Contract
 - Compile and deploy `contracts/SonicSniperExecutor.sol` from your hot wallet.
 - Approve the executor to spend base token for the owner wallet.
+- Optional: set `executor.auto_approve_mode = "max"` (or `"exact"`) to let the bot send base-token approvals on demand (the bot will reset allowance to 0 first when a nonzero allowance exists).
+- Buys send tokens to the executor contract; no extra approval is needed to sell those positions.
 - Optional: call `setUseFeeOnTransfer(true)` for fee-on-transfer routers.
 - If you need Solidly/native execution, redeploy after updating the ABI to include `buySolidly`/`buySolidlyETH`/`buyV2ETH`.
 - Run `sniper deploy-contract` to print the canonical ABI hash and verify the configured executor address bytecode against `contracts/bytecode/SonicSniperExecutor.hex` when available.
+- ABI hashes still change if the ABI entry order changes; treat the hash as a local fingerprint, not a cross-tool guarantee.
 
 ## Local Fork Pipeline Test
 - Run an anvil fork on a different port than the full node (example uses `9555`) and keep chain id `146`:
@@ -69,9 +73,18 @@ SNIPER_PK=0x<hex_private_key>
 anvil --fork-url http://127.0.0.1:8545 --port 9555 --chain-id 146
 ```
 
-- Use `config/sonic.anvil.toml` so both HTTP/WS point at `ws://127.0.0.1:9555`.
+- Use `config/sonic.anvil.toml` so HTTP points at `http://127.0.0.1:9555` and WS points at `ws://127.0.0.1:9555`.
 - Keep `mempool.mode = "ws"` on the fork (anvil does not support `txpool_content`).
 - Deploy the executor on the fork, fund the hot wallet, and run the bot with the anvil config to exercise the full flow.
+- Optional helper scripts: `scripts/anvil_pipeline.sh` (compile/deploy + in-place config update) and `scripts/submit_liquidity_eth.sh` (send a forked addLiquidityETH tx).
+- `scripts/submit_liquidity_eth.sh` defaults to the second anvil account as the LP wallet (`LP_PK`), and still needs a forked `WHALE` holder address to transfer tokens in.
+- This anvil flow is the chosen full-pipeline verification approach before mainnet runs.
+
+## Token Zoo Risk Harness (Anvil)
+- Use a small set of test tokens to deterministically hit risk paths: standard ERC20, fee-on-transfer, honeypot/blacklist (revert on transfer), bad metadata (empty/long name/symbol), and a non-standard storage token (USDC-style).
+- Deploy tokens to the fork, mint to the LP account, then add liquidity via `scripts/submit_liquidity_eth.sh` (Shadow router).
+- Recommended risk settings for clear signals: `risk.sell_simulation_mode = "strict"`, `risk.sellability_amount_base = "1000000000000000"`, and `risk.max_tax_bps = 500`.
+- Expected outcomes: standard passes + buy/exit; fee-on-transfer rejected on tax; honeypot rejected on sell simulation; bad metadata rejected on ERC20 sanity; non-standard storage passes when `risk.token_override_slots` is configured.
 
 ## Run
 ```

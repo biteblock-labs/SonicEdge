@@ -6,7 +6,8 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use anyhow::{bail, Result};
 use sonic_core::config::RiskConfig;
-use sonic_core::utils::parse_u256_decimal;
+use sonic_core::utils::{parse_address, parse_u256_decimal};
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::time::Duration;
@@ -38,6 +39,19 @@ const ERC20_ALLOWANCES_SLOT: u64 = 1;
 const SIMULATION_DEADLINE_SECS: u64 = 10_000_000_000;
 const SIMULATION_SENDER: Address = address!("0x1111111111111111111111111111111111111111");
 
+#[derive(Clone, Copy)]
+struct TokenOverrideSlots {
+    balance_slot: u64,
+    allowance_slot: u64,
+}
+
+impl TokenOverrideSlots {
+    const DEFAULT: Self = Self {
+        balance_slot: ERC20_BALANCES_SLOT,
+        allowance_slot: ERC20_ALLOWANCES_SLOT,
+    };
+}
+
 #[derive(Clone)]
 pub struct RiskEngine {
     cfg: RiskConfig,
@@ -45,6 +59,7 @@ pub struct RiskEngine {
     call_timeout: Duration,
     sell_simulation_mode: SellSimulationMode,
     sell_simulation_override_mode: SellSimulationOverrideMode,
+    token_override_slots: HashMap<Address, TokenOverrideSlots>,
 }
 
 enum SellSimulationResult {
@@ -103,12 +118,24 @@ impl RiskEngine {
         let sell_simulation_mode = SellSimulationMode::parse(&cfg.sell_simulation_mode)?;
         let sell_simulation_override_mode =
             SellSimulationOverrideMode::parse(&cfg.sell_simulation_override_mode)?;
+        let mut token_override_slots = HashMap::new();
+        for entry in &cfg.token_override_slots {
+            let token = parse_address(entry.token.trim())?;
+            token_override_slots.insert(
+                token,
+                TokenOverrideSlots {
+                    balance_slot: entry.balance_slot,
+                    allowance_slot: entry.allowance_slot,
+                },
+            );
+        }
         Ok(Self {
             cfg,
             sellability_amount_base,
             call_timeout,
             sell_simulation_mode,
             sell_simulation_override_mode,
+            token_override_slots,
         })
     }
 
@@ -420,6 +447,13 @@ impl RiskEngine {
         }
     }
 
+    fn override_slots(&self, token: Address) -> TokenOverrideSlots {
+        self.token_override_slots
+            .get(&token)
+            .copied()
+            .unwrap_or(TokenOverrideSlots::DEFAULT)
+    }
+
     async fn simulate_sell(
         &self,
         ctx: &RiskContext<'_>,
@@ -453,8 +487,9 @@ impl RiskEngine {
             input: TransactionInput::new(call.abi_encode().into()),
             ..Default::default()
         };
+        let slots = self.override_slots(ctx.token);
         let overrides =
-            sell_simulation_overrides(ctx.token, SIMULATION_SENDER, ctx.router, amount_in);
+            sell_simulation_overrides(ctx.token, SIMULATION_SENDER, ctx.router, amount_in, slots);
         let data = self
             .with_timeout("router swapExactTokensForTokens (simulated)", async {
                 ctx.provider.call(tx).overrides(overrides).await
@@ -529,8 +564,9 @@ impl RiskEngine {
             input: TransactionInput::new(call.abi_encode().into()),
             ..Default::default()
         };
+        let slots = self.override_slots(ctx.token);
         let overrides =
-            sell_simulation_overrides(ctx.token, SIMULATION_SENDER, ctx.router, amount_in);
+            sell_simulation_overrides(ctx.token, SIMULATION_SENDER, ctx.router, amount_in, slots);
         let data = self
             .with_timeout("router swapExactTokensForTokens (simulated)", async {
                 ctx.provider.call(tx).overrides(overrides).await
@@ -585,7 +621,9 @@ impl RiskEngine {
             input: TransactionInput::new(call.abi_encode().into()),
             ..Default::default()
         };
-        let overrides = sell_simulation_overrides(ctx.token, SIMULATION_SENDER, ctx.router, amount_in);
+        let slots = self.override_slots(ctx.token);
+        let overrides =
+            sell_simulation_overrides(ctx.token, SIMULATION_SENDER, ctx.router, amount_in, slots);
         self.with_timeout(
             "router swapExactTokensForTokensSupportingFeeOnTransferTokens (simulated)",
             async { ctx.provider.call(tx).overrides(overrides).await },
@@ -667,10 +705,11 @@ fn sell_simulation_overrides(
     owner: Address,
     spender: Address,
     amount_in: U256,
+    slots: TokenOverrideSlots,
 ) -> StateOverride {
-    // Assumes standard ERC20 storage layout: balances at slot 0, allowances at slot 1.
-    let balance_slot = mapping_slot(owner, ERC20_BALANCES_SLOT);
-    let allowance_slot = double_mapping_slot(owner, spender, ERC20_ALLOWANCES_SLOT);
+    // Assumes standard ERC20 storage layout unless overridden per token.
+    let balance_slot = mapping_slot(owner, slots.balance_slot);
+    let allowance_slot = double_mapping_slot(owner, spender, slots.allowance_slot);
     StateOverridesBuilder::default()
         .append(
             token,
@@ -803,6 +842,7 @@ mod tests {
             erc20_call_timeout_ms: 500,
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -875,6 +915,7 @@ mod tests {
             erc20_call_timeout_ms: 500,
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -917,6 +958,7 @@ mod tests {
             erc20_call_timeout_ms: 500,
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -959,6 +1001,7 @@ mod tests {
             erc20_call_timeout_ms: 500,
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1013,6 +1056,7 @@ mod tests {
             erc20_call_timeout_ms: 500,
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1083,6 +1127,7 @@ mod tests {
             erc20_call_timeout_ms: 500,
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1139,6 +1184,7 @@ mod tests {
             erc20_call_timeout_ms: 500,
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1198,6 +1244,7 @@ mod tests {
             erc20_call_timeout_ms: 500,
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1263,6 +1310,7 @@ mod tests {
             erc20_call_timeout_ms: 500,
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1330,6 +1378,7 @@ mod tests {
             erc20_call_timeout_ms: 500,
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1399,6 +1448,7 @@ mod tests {
             erc20_call_timeout_ms: 500,
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "skip_any".to_string(),
+            token_override_slots: Vec::new(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1465,6 +1515,7 @@ mod tests {
             erc20_call_timeout_ms: 500,
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "skip_any".to_string(),
+            token_override_slots: Vec::new(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
