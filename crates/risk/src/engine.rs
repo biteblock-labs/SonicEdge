@@ -42,6 +42,10 @@ const ERC20_BALANCES_SLOT: u64 = 0;
 const ERC20_ALLOWANCES_SLOT: u64 = 1;
 const SIMULATION_DEADLINE_SECS: u64 = 10_000_000_000;
 const SIMULATION_SENDER: Address = address!("0x1111111111111111111111111111111111111111");
+const LP_BURN_ADDRESSES: [Address; 2] = [
+    Address::ZERO,
+    address!("0x000000000000000000000000000000000000dEaD"),
+];
 const TRADING_ENABLED_SIGS: [&str; 4] = [
     "tradingEnabled()",
     "tradingActive()",
@@ -89,6 +93,18 @@ impl TokenOverrideSlots {
     };
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LpCheckMode {
+    Strict,
+    BestEffort,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LpBurnMode {
+    Any,
+    All,
+}
+
 #[derive(Clone)]
 pub struct RiskEngine {
     cfg: RiskConfig,
@@ -97,6 +113,11 @@ pub struct RiskEngine {
     sell_simulation_mode: SellSimulationMode,
     sell_simulation_override_mode: SellSimulationOverrideMode,
     token_override_slots: HashMap<Address, TokenOverrideSlots>,
+    lp_lockers: Vec<Address>,
+    min_lp_burn_bps: u32,
+    min_lp_lock_bps: u32,
+    lp_check_mode: LpCheckMode,
+    lp_burn_mode: LpBurnMode,
     discovered_override_slots: Arc<Mutex<HashMap<Address, TokenOverrideSlots>>>,
 }
 
@@ -133,6 +154,21 @@ impl RiskEngine {
                 },
             );
         }
+        let min_lp_burn_bps = cfg.min_lp_burn_bps;
+        let min_lp_lock_bps = cfg.min_lp_lock_bps;
+        let lp_check_mode = match cfg.lp_lock_check_mode.trim().to_ascii_lowercase().as_str() {
+            "best_effort" => LpCheckMode::BestEffort,
+            _ => LpCheckMode::Strict,
+        };
+        let lp_burn_mode = match cfg.lp_lock_burn_mode.trim().to_ascii_lowercase().as_str() {
+            "all" => LpBurnMode::All,
+            _ => LpBurnMode::Any,
+        };
+        let mut lp_lockers = Vec::new();
+        for entry in &cfg.lp_lockers {
+            let locker = parse_address(entry.trim())?;
+            lp_lockers.push(locker);
+        }
         Ok(Self {
             cfg,
             sellability_amount_base,
@@ -140,6 +176,11 @@ impl RiskEngine {
             sell_simulation_mode,
             sell_simulation_override_mode,
             token_override_slots,
+            lp_lockers,
+            min_lp_burn_bps,
+            min_lp_lock_bps,
+            lp_check_mode,
+            lp_burn_mode,
             discovered_override_slots: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -154,6 +195,7 @@ impl RiskEngine {
         findings.extend(self.check_erc20_sanity(ctx).await);
         findings.extend(self.check_trading_controls(ctx).await);
         findings.extend(self.check_limit_controls(ctx).await);
+        findings.extend(self.check_lp_lock_and_burn(ctx).await);
         findings.extend(self.check_sellability_and_tax(ctx).await);
 
         if findings.is_empty() {
@@ -503,6 +545,97 @@ impl RiskEngine {
         findings
     }
 
+    async fn check_lp_lock_and_burn(&self, ctx: &RiskContext<'_>) -> Vec<RiskFinding> {
+        let mut findings = Vec::new();
+        let require_burn = self.min_lp_burn_bps > 0;
+        let require_lock = self.min_lp_lock_bps > 0;
+        if !require_burn && !require_lock {
+            return findings;
+        }
+
+        let Some(pair) = ctx.pair else {
+            if self.lp_check_mode == LpCheckMode::BestEffort {
+                return findings;
+            }
+            findings.push(RiskFinding::new(
+                "lp lock/burn check unavailable (pair unresolved)",
+                SCORE_MEDIUM,
+            ));
+            return findings;
+        };
+
+        let total_supply = match self.erc20_total_supply_for(pair, ctx).await {
+            Ok(total_supply) => total_supply,
+            Err(reason) => {
+                findings.push(RiskFinding::new(reason, SCORE_HIGH));
+                return findings;
+            }
+        };
+        if total_supply.is_zero() {
+            if self.lp_check_mode == LpCheckMode::BestEffort {
+                return findings;
+            }
+            findings.push(RiskFinding::new(
+                "lp totalSupply is zero; cannot evaluate lock/burn",
+                SCORE_HIGH,
+            ));
+            return findings;
+        }
+
+        let mut burned = U256::ZERO;
+        for addr in LP_BURN_ADDRESSES {
+            match self.erc20_balance_of_for(pair, addr, ctx).await {
+                Ok(balance) => burned = burned.saturating_add(balance),
+                Err(reason) => {
+                    findings.push(RiskFinding::new(reason, SCORE_HIGH));
+                    return findings;
+                }
+            }
+        }
+
+        let mut locked = U256::ZERO;
+        if require_lock {
+            if self.lp_lockers.is_empty() {
+                findings.push(RiskFinding::new(
+                    "lp lock check enabled but no lockers configured",
+                    SCORE_HIGH,
+                ));
+                return findings;
+            }
+            for locker in &self.lp_lockers {
+                match self.erc20_balance_of_for(pair, *locker, ctx).await {
+                    Ok(balance) => locked = locked.saturating_add(balance),
+                    Err(reason) => {
+                        findings.push(RiskFinding::new(reason, SCORE_HIGH));
+                        return findings;
+                    }
+                }
+            }
+        }
+
+        let burn_bps = limit_bps(burned, total_supply);
+        let lock_bps = limit_bps(locked, total_supply);
+        let burn_ok = require_burn && burn_bps >= U256::from(self.min_lp_burn_bps as u64);
+        let lock_ok = require_lock && lock_bps >= U256::from(self.min_lp_lock_bps as u64);
+        let ok = if self.lp_burn_mode == LpBurnMode::All {
+            (if require_burn { burn_ok } else { true })
+                && (if require_lock { lock_ok } else { true })
+        } else {
+            burn_ok || lock_ok
+        };
+        if !ok {
+            findings.push(RiskFinding::new(
+                format!(
+                    "lp lock/burn below threshold: burned={}bps locked={}bps",
+                    burn_bps, lock_bps
+                ),
+                SCORE_HIGH,
+            ));
+        }
+
+        findings
+    }
+
     async fn first_bool_flag(
         &self,
         ctx: &RiskContext<'_>,
@@ -623,9 +756,17 @@ impl RiskEngine {
     }
 
     async fn erc20_total_supply(&self, ctx: &RiskContext<'_>) -> Result<U256, String> {
+        self.erc20_total_supply_for(ctx.token, ctx).await
+    }
+
+    async fn erc20_total_supply_for(
+        &self,
+        token: Address,
+        ctx: &RiskContext<'_>,
+    ) -> Result<U256, String> {
         let call = IERC20::totalSupplyCall {};
         let tx = TransactionRequest {
-            to: Some(TxKind::Call(ctx.token)),
+            to: Some(TxKind::Call(token)),
             input: TransactionInput::new(call.abi_encode().into()),
             ..Default::default()
         };
@@ -634,6 +775,25 @@ impl RiskEngine {
             .await?;
         IERC20::totalSupplyCall::abi_decode_returns(&data)
             .map_err(|err| format!("token totalSupply decode failed: {err}"))
+    }
+
+    async fn erc20_balance_of_for(
+        &self,
+        token: Address,
+        account: Address,
+        ctx: &RiskContext<'_>,
+    ) -> Result<U256, String> {
+        let call = IERC20::balanceOfCall { account };
+        let tx = TransactionRequest {
+            to: Some(TxKind::Call(token)),
+            input: TransactionInput::new(call.abi_encode().into()),
+            ..Default::default()
+        };
+        let data = self
+            .with_timeout("token balanceOf", async { ctx.provider.call(tx).await })
+            .await?;
+        IERC20::balanceOfCall::abi_decode_returns(&data)
+            .map_err(|err| format!("token balanceOf decode failed: {err}"))
     }
 
     async fn erc20_decimals(&self, ctx: &RiskContext<'_>) -> Result<u8, String> {
@@ -1340,7 +1500,7 @@ fn selector(signature: &str) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_tax_excessive, loss_bps, RiskContext, RiskEngine, MAX_TX_SIGS, MAX_WALLET_SIGS,
+        is_tax_excessive, loss_bps, RiskContext, RiskEngine, IERC20, MAX_TX_SIGS, MAX_WALLET_SIGS,
         SCORE_HIGH, SCORE_MEDIUM,
     };
     use alloy::primitives::{address, Bytes, Uint, U256};
@@ -1349,7 +1509,7 @@ mod tests {
     use alloy::transports::mock::Asserter;
     use sonic_core::config::RiskConfig;
 
-    use crate::abi::{ISolidlyRouter, IUniswapV2Pair, IUniswapV2Router02, IERC20};
+    use crate::abi::{ISolidlyRouter, IUniswapV2Pair, IUniswapV2Router02};
 
     #[test]
     fn loss_bps_zero_on_gain() {
@@ -1388,6 +1548,11 @@ mod tests {
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1467,6 +1632,11 @@ mod tests {
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1515,6 +1685,11 @@ mod tests {
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1568,6 +1743,11 @@ mod tests {
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1622,6 +1802,11 @@ mod tests {
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1685,6 +1870,11 @@ mod tests {
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1744,6 +1934,11 @@ mod tests {
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1806,6 +2001,11 @@ mod tests {
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1868,6 +2068,11 @@ mod tests {
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1921,6 +2126,11 @@ mod tests {
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -1969,6 +2179,11 @@ mod tests {
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -2029,6 +2244,11 @@ mod tests {
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -2105,6 +2325,11 @@ mod tests {
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -2167,6 +2392,11 @@ mod tests {
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -2232,6 +2462,11 @@ mod tests {
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -2303,6 +2538,11 @@ mod tests {
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -2359,6 +2599,442 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assess_rejects_when_lp_burn_below_threshold() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "0".to_string(),
+            max_tax_bps: 0,
+            erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
+            sell_simulation_mode: "best_effort".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
+            min_lp_burn_bps: 5000,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: None,
+            sellability_enabled: false,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"Token".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TKN".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::totalSupplyCall::abi_encode_returns(&U256::from(1_000u64)),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::balanceOfCall::abi_encode_returns(&U256::from(100u64)),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::balanceOfCall::abi_encode_returns(&U256::from(0u64)),
+        );
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(!decision.pass);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("lp lock/burn below threshold")));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assess_rejects_when_lp_pair_unresolved_in_strict() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "0".to_string(),
+            max_tax_bps: 0,
+            erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
+            sell_simulation_mode: "best_effort".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
+            min_lp_burn_bps: 5000,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: None,
+            stable: None,
+            sellability_enabled: false,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"Token".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TKN".to_string()),
+        );
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(!decision.pass);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("pair unresolved")));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assess_passes_when_lp_pair_unresolved_in_best_effort() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "0".to_string(),
+            max_tax_bps: 0,
+            erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
+            sell_simulation_mode: "best_effort".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
+            min_lp_burn_bps: 5000,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "best_effort".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: None,
+            stable: None,
+            sellability_enabled: false,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"Token".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TKN".to_string()),
+        );
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(decision.pass);
+        assert!(decision.reasons.is_empty());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assess_passes_when_lp_total_supply_zero_in_best_effort() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "0".to_string(),
+            max_tax_bps: 0,
+            erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
+            sell_simulation_mode: "best_effort".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
+            min_lp_burn_bps: 5000,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "best_effort".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: None,
+            sellability_enabled: false,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"Token".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TKN".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::totalSupplyCall::abi_encode_returns(&U256::from(0u64)),
+        );
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(decision.pass);
+        assert!(decision.reasons.is_empty());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assess_rejects_when_lp_all_requires_both_thresholds() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "0".to_string(),
+            max_tax_bps: 0,
+            erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
+            sell_simulation_mode: "best_effort".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
+            min_lp_burn_bps: 5000,
+            min_lp_lock_bps: 5000,
+            lp_lockers: vec!["0x5000000000000000000000000000000000000005".to_string()],
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "all".to_string(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: None,
+            sellability_enabled: false,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"Token".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TKN".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::totalSupplyCall::abi_encode_returns(&U256::from(1_000u64)),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::balanceOfCall::abi_encode_returns(&U256::from(600u64)),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::balanceOfCall::abi_encode_returns(&U256::from(0u64)),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::balanceOfCall::abi_encode_returns(&U256::from(100u64)),
+        );
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(!decision.pass);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("lp lock/burn below threshold")));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assess_passes_when_lp_any_accepts_lock_threshold() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "0".to_string(),
+            max_tax_bps: 0,
+            erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
+            sell_simulation_mode: "best_effort".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
+            min_lp_burn_bps: 5000,
+            min_lp_lock_bps: 5000,
+            lp_lockers: vec!["0x5000000000000000000000000000000000000005".to_string()],
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: None,
+            sellability_enabled: false,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"Token".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TKN".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::totalSupplyCall::abi_encode_returns(&U256::from(1_000u64)),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::balanceOfCall::abi_encode_returns(&U256::from(0u64)),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::balanceOfCall::abi_encode_returns(&U256::from(0u64)),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::balanceOfCall::abi_encode_returns(&U256::from(600u64)),
+        );
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(decision.pass);
+        assert!(decision.reasons.is_empty());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assess_passes_when_lp_lock_above_threshold() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "0".to_string(),
+            max_tax_bps: 0,
+            erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
+            sell_simulation_mode: "best_effort".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 5000,
+            lp_lockers: vec!["0x5000000000000000000000000000000000000005".to_string()],
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: Some(address!("0x4000000000000000000000000000000000000004")),
+            stable: None,
+            sellability_enabled: false,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"Token".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TKN".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::totalSupplyCall::abi_encode_returns(&U256::from(1_000u64)),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::balanceOfCall::abi_encode_returns(&U256::from(0u64)),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::balanceOfCall::abi_encode_returns(&U256::from(0u64)),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::balanceOfCall::abi_encode_returns(&U256::from(600u64)),
+        );
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(decision.pass);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
     async fn assess_rejects_when_swap_failure_not_fee_on_transfer() {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new()
@@ -2376,6 +3052,11 @@ mod tests {
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -2451,6 +3132,11 @@ mod tests {
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "skip_any".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {
@@ -2523,6 +3209,11 @@ mod tests {
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "skip_any".to_string(),
             token_override_slots: Vec::new(),
+            min_lp_burn_bps: 0,
+            min_lp_lock_bps: 0,
+            lp_lockers: Vec::new(),
+            lp_lock_check_mode: "strict".to_string(),
+            lp_lock_burn_mode: "any".to_string(),
         };
         let engine = RiskEngine::new(cfg).unwrap();
         let ctx = RiskContext {

@@ -102,6 +102,16 @@ pub struct RiskConfig {
     pub sell_simulation_override_mode: String,
     #[serde(default)]
     pub token_override_slots: Vec<TokenOverrideSlotsConfig>,
+    #[serde(default)]
+    pub min_lp_burn_bps: u32,
+    #[serde(default)]
+    pub min_lp_lock_bps: u32,
+    #[serde(default)]
+    pub lp_lockers: Vec<String>,
+    #[serde(default = "default_lp_lock_check_mode")]
+    pub lp_lock_check_mode: String,
+    #[serde(default = "default_lp_lock_burn_mode")]
+    pub lp_lock_burn_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +278,10 @@ impl AppConfig {
         )?;
         ensure_valid_sell_simulation_mode(&self.risk.sell_simulation_mode)?;
         ensure_valid_sell_simulation_override_mode(&self.risk.sell_simulation_override_mode)?;
+        ensure_max_bps("risk.min_lp_burn_bps", self.risk.min_lp_burn_bps)?;
+        ensure_max_bps("risk.min_lp_lock_bps", self.risk.min_lp_lock_bps)?;
+        ensure_valid_lp_lock_check_mode(&self.risk.lp_lock_check_mode)?;
+        ensure_valid_lp_lock_burn_mode(&self.risk.lp_lock_burn_mode)?;
         let mut override_tokens = HashSet::new();
         for entry in &self.risk.token_override_slots {
             ensure_non_empty("risk.token_override_slots.token", &entry.token)?;
@@ -278,6 +292,20 @@ impl AppConfig {
             if !override_tokens.insert(token) {
                 bail_config!("risk.token_override_slots token {token:?} appears more than once");
             }
+        }
+        let mut lockers = HashSet::new();
+        for entry in &self.risk.lp_lockers {
+            ensure_non_empty("risk.lp_lockers", entry)?;
+            let locker = parse_address(entry.trim())?;
+            if locker == Address::ZERO {
+                bail_config!("risk.lp_lockers must not include zero address");
+            }
+            if !lockers.insert(locker) {
+                bail_config!("risk.lp_lockers address {locker:?} appears more than once");
+            }
+        }
+        if self.risk.min_lp_lock_bps > 0 && self.risk.lp_lockers.is_empty() {
+            bail_config!("risk.min_lp_lock_bps set but risk.lp_lockers is empty");
         }
 
         ensure_non_empty(
@@ -475,6 +503,22 @@ fn ensure_valid_log_format(value: &str) -> Result<()> {
     }
 }
 
+fn ensure_valid_lp_lock_check_mode(value: &str) -> Result<()> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "strict" | "best_effort" => Ok(()),
+        _ => bail_config!("unsupported risk.lp_lock_check_mode: {value}"),
+    }
+}
+
+fn ensure_valid_lp_lock_burn_mode(value: &str) -> Result<()> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "any" | "all" => Ok(()),
+        _ => bail_config!("unsupported risk.lp_lock_burn_mode: {value}"),
+    }
+}
+
 fn default_pair_cache_capacity() -> usize {
     2048
 }
@@ -493,6 +537,14 @@ fn default_sell_simulation_mode() -> String {
 
 fn default_sell_simulation_override_mode() -> String {
     "detect".to_string()
+}
+
+fn default_lp_lock_check_mode() -> String {
+    "strict".to_string()
+}
+
+fn default_lp_lock_burn_mode() -> String {
+    "any".to_string()
 }
 
 fn default_launch_only_liquidity_gate_mode() -> String {
@@ -649,4 +701,136 @@ pub struct RouterFactoryConfig {
 pub struct FactoryPairCodeHashConfig {
     pub factory: String,
     pub pair_code_hash: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_config() -> AppConfig {
+        AppConfig {
+            chain: ChainConfig {
+                chain_id: 1,
+                rpc_http: "http://localhost:8545".to_string(),
+                rpc_ws: "ws://localhost:8546".to_string(),
+            },
+            mempool: MempoolConfig {
+                mode: "ws+txpool".to_string(),
+                txpool_poll_ms: 1,
+                fetch_concurrency: 1,
+                tx_fetch_timeout_ms: 1,
+                dedup_capacity: 1,
+                dedup_ttl_ms: 1,
+                ws_reconnect_base_ms: 1,
+                ws_reconnect_max_ms: 1,
+            },
+            dex: DexConfig {
+                routers: vec!["0x0000000000000000000000000000000000000001".to_string()],
+                factories: vec!["0x0000000000000000000000000000000000000002".to_string()],
+                router_factories: Vec::new(),
+                factory_pair_code_hashes: Vec::new(),
+                wrapped_native: None,
+                base_tokens: vec!["0x0000000000000000000000000000000000000003".to_string()],
+                pair_cache_capacity: 1,
+                pair_cache_ttl_ms: 1,
+                pair_cache_negative_ttl_ms: 1,
+                sellability_recheck_interval_ms: 1,
+                allow_execution_without_pair: false,
+                launch_only_liquidity_gate: true,
+                launch_only_liquidity_gate_mode: "strict".to_string(),
+                min_base_amount: "1".to_string(),
+                max_slippage_bps: 100,
+                deadline_secs: 1,
+            },
+            risk: RiskConfig {
+                sellability_amount_base: "1".to_string(),
+                max_tax_bps: 0,
+                erc20_call_timeout_ms: 1,
+                trading_control_check: false,
+                trading_control_fail_closed: false,
+                max_tx_min_supply_bps: 0,
+                max_wallet_min_supply_bps: 0,
+                max_cooldown_secs: 0,
+                sell_simulation_mode: "best_effort".to_string(),
+                sell_simulation_override_mode: "detect".to_string(),
+                token_override_slots: Vec::new(),
+                min_lp_burn_bps: 0,
+                min_lp_lock_bps: 0,
+                lp_lockers: Vec::new(),
+                lp_lock_check_mode: "strict".to_string(),
+                lp_lock_burn_mode: "any".to_string(),
+            },
+            executor: ExecutorConfig {
+                owner_private_key_env: "SNIPER_PK".to_string(),
+                executor_contract: "0x0000000000000000000000000000000000000004".to_string(),
+                gas_mode: "eip1559".to_string(),
+                auto_approve_mode: "off".to_string(),
+                gas_limit_buffer_bps: 0,
+                max_fee_gwei: 1,
+                max_priority_gwei: 1,
+                bump_pct: 0,
+                bump_interval_ms: 1,
+                nonce_sync_interval_ms: 1,
+                nonce_retry_delay_ms: 1,
+                nonce_retry_max_retries: 1,
+                receipt_poll_interval_ms: 1,
+                receipt_timeout_ms: 1,
+                max_block_number_delta: 1,
+            },
+            strategy: StrategyConfig {
+                take_profit_bps: 0,
+                stop_loss_bps: 0,
+                max_hold_secs: 1,
+                exit_signal_ttl_secs: 1,
+                emergency_reserve_drop_bps: 0,
+                emergency_sell_sim_failures: 0,
+                buy_amount_mode: "fixed".to_string(),
+                buy_amount_fixed: "1".to_string(),
+                buy_amount_wallet_bps: 0,
+                buy_amount_min: "0".to_string(),
+                buy_amount_max: "0".to_string(),
+                buy_amount_max_liquidity_bps: 0,
+                buy_amount_unavailable_retry_ttl_ms: 1,
+                buy_amount_native_reserve: "0".to_string(),
+                position_log_interval_ms: 1,
+                position_store_path: None,
+                wait_for_mine: true,
+                same_block_attempt: false,
+                same_block_requires_reserves: true,
+                wait_for_mine_poll_interval_ms: 1,
+                wait_for_mine_timeout_ms: 1,
+                candidate_cache_capacity: 1,
+                candidate_ttl_ms: 1,
+            },
+            observability: ObservabilityConfig {
+                metrics_enabled: false,
+                metrics_bind: "127.0.0.1:0".to_string(),
+                log_level: "info".to_string(),
+                log_format: "pretty".to_string(),
+                base_usd_price: None,
+                base_decimals: 18,
+            },
+        }
+    }
+
+    #[test]
+    fn validate_rejects_lp_lock_bps_without_lockers() {
+        let mut cfg = base_config();
+        cfg.risk.min_lp_lock_bps = 5000;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("risk.min_lp_lock_bps set but risk.lp_lockers is empty"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_lp_modes() {
+        let mut cfg = base_config();
+        cfg.risk.lp_lock_check_mode = "unknown".to_string();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("risk.lp_lock_check_mode"));
+
+        let mut cfg = base_config();
+        cfg.risk.lp_lock_burn_mode = "unknown".to_string();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("risk.lp_lock_burn_mode"));
+    }
 }

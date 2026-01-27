@@ -126,5 +126,6 @@ forge test
 - `risk.sell_simulation_override_mode` (`detect`/`skip_any`) controls how override-related RPC errors are classified.
 - `risk.trading_control_check` enables paused/trading-enabled/start-time probes; `risk.trading_control_fail_closed` turns block-timestamp failures into high-severity rejects (default false).
 - `risk.max_tx_min_supply_bps` and `risk.max_wallet_min_supply_bps` enforce minimum maxTx/maxWallet as bps of total supply; `risk.max_cooldown_secs` caps transfer cooldown seconds (0 disables each).
+- `risk.min_lp_burn_bps` / `risk.min_lp_lock_bps` enforce minimum LP burn/lock bps; configure `risk.lp_lockers` with known locker addresses. `risk.lp_lock_burn_mode` controls `any` (default OR) vs `all` (AND) semantics, and `risk.lp_lock_check_mode` controls strict vs best-effort behavior when the pair is unresolved.
 - Some Solidly routers (e.g. SwapX RouterV2) do not expose `WETH()/weth()` getters; rely on docs/on-chain transfer traces for the wrapped base token and include wS `0x039e2fB66102314Ce7b64Ce5Ce3E5183bc94aD38` in `dex.base_tokens`.
 - Solidly addLiquidity includes a `stable` flag; the bot carries this into pair resolution and execution.

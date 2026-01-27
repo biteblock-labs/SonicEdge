@@ -52,6 +52,7 @@ geth \
 - Set `risk.sell_simulation_mode` (`strict`/`best_effort`) and `risk.sell_simulation_override_mode` (`detect`/`skip_any`) to tune sell simulation enforcement.
 - Set `risk.trading_control_check = true` to reject tokens with paused/disabled trading or future start-time gates; `risk.trading_control_fail_closed = true` makes start-time failures fatal (default false).
 - Set `risk.max_tx_min_supply_bps`, `risk.max_wallet_min_supply_bps`, and `risk.max_cooldown_secs` to enforce maxTx/maxWallet/cooldown thresholds (0 disables each).
+- Set `risk.min_lp_burn_bps` / `risk.min_lp_lock_bps` to enforce minimum LP burn/lock bps; configure `risk.lp_lockers` with known locker addresses. Use `risk.lp_lock_burn_mode = "any"` (default, OR) or `"all"` (AND), and `risk.lp_lock_check_mode = "best_effort"` if you want to skip the check when the pair is unresolved.
 - Raise `risk.max_tax_bps` if you intend to trade fee-on-transfer tokens with higher taxes.
 - For illiquid launches, consider loosening the limits (lower `max_tx_min_supply_bps`/`max_wallet_min_supply_bps`, higher `max_cooldown_secs`, or `trading_control_fail_closed = false`).
 - Use `risk.token_override_slots` to define non-standard ERC20 storage layouts (balance/allowance slots) so sell simulation and quote overrides work on tokens like USDC.

@@ -5415,6 +5415,11 @@ mod tests {
                 sell_simulation_mode: "best_effort".to_string(),
                 sell_simulation_override_mode: "detect".to_string(),
                 token_override_slots: Vec::new(),
+                min_lp_burn_bps: 0,
+                min_lp_lock_bps: 0,
+                lp_lockers: Vec::new(),
+                lp_lock_check_mode: "strict".to_string(),
+                lp_lock_burn_mode: "any".to_string(),
             },
             executor: ExecutorConfig {
                 owner_private_key_env: "SNIPER_PK".to_string(),

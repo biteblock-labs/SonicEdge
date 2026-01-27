@@ -43,6 +43,11 @@ max_cooldown_secs = 0
 sell_simulation_mode = "best_effort"
 sell_simulation_override_mode = "detect"
 token_override_slots = []
+min_lp_burn_bps = 0
+min_lp_lock_bps = 0
+lp_lockers = []
+lp_lock_check_mode = "strict"
+lp_lock_burn_mode = "any"
 
 [executor]
 owner_private_key_env = "SNIPER_PK"

@@ -96,6 +96,7 @@ Txpool backfill   |------> | V2 Decoder   |
 - Missed pending txs: txpool backfill + dedupe window.
 - Slow decoding: fast selector gating, minimal allocations.
 - Scam/tax tokens: risk engine checks (trading toggles, maxTx/maxWallet/cooldown heuristics, sell simulation/tax).
+- LP safety: optional LP burn/lock heuristics based on LP token balances at burn/locker addresses; configurable OR/AND semantics and strict/best-effort when pairs are unresolved.
 - Late inclusion: `maxBlockNumber` guard enforced in live flow to avoid late inclusion.
 - Pair resolution: router->factory mapping avoids cross-DEX pair mismatches; CREATE2 derivation uses factory init code hashes when `getPair` misses; negative cache TTL keeps new pools discoverable.
 - Launch-only gate: checks pair code/reserves at the prior block; strict/best-effort modes decide how to handle missing historical state.

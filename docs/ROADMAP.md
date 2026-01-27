@@ -51,7 +51,7 @@ Developer roadmap with checklist items aligned to the original scope.
 - [ ] Anti-scam: upgradeable proxy/backdoor detection (EIP-1967/Transparent/UUPS)
 - [ ] Anti-scam: rebase/elastic supply detection and accounting guardrails
 - [ ] Anti-scam: non‑standard ERC20 behavior (returns false, approve(0) requirement)
-- [ ] Anti-scam: LP lock/withdraw heuristics (owner‑removable liquidity)
+- [x] Anti-scam: LP burn/lock heuristics via LP token balance checks
 
 ## Phase 4: Execution Engine (V1)
 - [x] Executor tx builder for `buyV2`

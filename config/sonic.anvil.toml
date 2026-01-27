@@ -68,6 +68,11 @@ token_override_slots = [
   { token = "0x46b142DD1E924FAb83eCc3c08e4D46E82f005e0E", balance_slot = 6, allowance_slot = 7 },
   { token = "0xC9a43158891282A2B1475592D5719c001986Aaec", balance_slot = 6, allowance_slot = 7 },
 ]
+min_lp_burn_bps = 0
+min_lp_lock_bps = 0
+lp_lockers = []
+lp_lock_check_mode = "strict"
+lp_lock_burn_mode = "any"
 
 [executor]
 owner_private_key_env = "SNIPER_PK"
