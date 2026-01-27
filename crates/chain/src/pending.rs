@@ -23,7 +23,12 @@ impl PendingTxStream {
         reconnect: ReconnectConfig,
         metrics: Option<ChannelMetrics>,
     ) -> Self {
-        Self { provider, channel_size, reconnect, metrics }
+        Self {
+            provider,
+            channel_size,
+            reconnect,
+            metrics,
+        }
     }
 
     pub async fn spawn(self) -> Result<TrackedReceiver<B256>> {

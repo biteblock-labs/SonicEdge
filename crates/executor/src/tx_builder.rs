@@ -198,11 +198,7 @@ impl ExecutorTxBuilder {
         tx
     }
 
-    pub fn build_buy_solidly(
-        &self,
-        params: BuySolidlyParams,
-        nonce: u64,
-    ) -> TransactionRequest {
+    pub fn build_buy_solidly(&self, params: BuySolidlyParams, nonce: u64) -> TransactionRequest {
         let call = SonicSniperExecutor::buySolidlyCall {
             router: params.router,
             tokenIn: params.token_in,
@@ -315,11 +311,7 @@ impl ExecutorTxBuilder {
         tx
     }
 
-    pub fn build_sell_solidly(
-        &self,
-        params: SellSolidlyParams,
-        nonce: u64,
-    ) -> TransactionRequest {
+    pub fn build_sell_solidly(&self, params: SellSolidlyParams, nonce: u64) -> TransactionRequest {
         let call = SonicSniperExecutor::sellSolidlyCall {
             router: params.router,
             tokenIn: params.token_in,
@@ -589,10 +581,7 @@ mod tests {
         };
 
         let data = ExecutorTxBuilder::encode_buy_solidly(params);
-        assert_eq!(
-            &data[0..4],
-            &SonicSniperExecutor::buySolidlyCall::SELECTOR
-        );
+        assert_eq!(&data[0..4], &SonicSniperExecutor::buySolidlyCall::SELECTOR);
 
         let decoded = SonicSniperExecutor::buySolidlyCall::abi_decode(&data).unwrap();
         assert_eq!(
@@ -796,10 +785,7 @@ mod tests {
         };
 
         let data = ExecutorTxBuilder::encode_sell_v2_eth(params);
-        assert_eq!(
-            &data[0..4],
-            &SonicSniperExecutor::sellV2ETHCall::SELECTOR
-        );
+        assert_eq!(&data[0..4], &SonicSniperExecutor::sellV2ETHCall::SELECTOR);
 
         let decoded = SonicSniperExecutor::sellV2ETHCall::abi_decode(&data).unwrap();
         assert_eq!(
@@ -848,10 +834,7 @@ mod tests {
         };
 
         let data = ExecutorTxBuilder::encode_sell_solidly(params);
-        assert_eq!(
-            &data[0..4],
-            &SonicSniperExecutor::sellSolidlyCall::SELECTOR
-        );
+        assert_eq!(&data[0..4], &SonicSniperExecutor::sellSolidlyCall::SELECTOR);
 
         let decoded = SonicSniperExecutor::sellSolidlyCall::abi_decode(&data).unwrap();
         assert_eq!(

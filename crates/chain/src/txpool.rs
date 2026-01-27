@@ -46,6 +46,7 @@ impl TxpoolBackfill {
                     }
                 };
 
+                let mut full = false;
                 for (_addr, txs) in content
                     .pending
                     .into_iter()
@@ -54,12 +55,21 @@ impl TxpoolBackfill {
                     for (_nonce, tx_obj) in txs {
                         match tx.try_send(tx_obj.tx_hash()) {
                             Ok(()) => {}
-                            Err(TrySendError::Full(_)) => {}
+                            Err(TrySendError::Full(_)) => {
+                                full = true;
+                                break;
+                            }
                             Err(TrySendError::Closed(_)) => {
                                 error!("txpool backfill receiver dropped");
                                 return;
                             }
                         }
+                        if full {
+                            break;
+                        }
+                    }
+                    if full {
+                        break;
                     }
                 }
             }

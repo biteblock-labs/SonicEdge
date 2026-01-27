@@ -61,6 +61,7 @@ just run
 - The bot is designed for local signing + raw sends; avoid RPC personal accounts.
 - Keep `SNIPER_PK` in a secure environment and avoid shell history leaks.
 - The CLI loads `.env` automatically; prefer an env file with `0600` permissions or a secrets manager (systemd `EnvironmentFile` works well).
+- Optional: set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` to enable Telegram alerts.
 - Never store private keys in config files or logs.
 - The executor contract is `Ownable` and NOT upgradeable.
 - Approvals should be tight and reset to zero after use.
@@ -72,6 +73,7 @@ just run
 ## Testing (Anvil)
 
 - For deterministic risk-path coverage, use a small “token zoo” on an anvil fork (standard ERC20, fee-on-transfer, honeypot/blacklist, bad metadata, non-standard storage). See `docs/ops-runbook.md` for the full checklist and recommended risk settings.
+- Local limit-check zoo tokens (addresses reset on anvil restart): ZOK `0xfbC22278A96299D91d41C453234d97b4F5Eb9B2d` (pass), ZST `0x46b142DD1E924FAb83eCc3c08e4D46E82f005e0E` (fail maxTx/maxWallet), ZCD `0xC9a43158891282A2B1475592D5719c001986Aaec` (fail cooldown).
 - Anvil is the chosen full-pipeline verification approach before mainnet runs.
 
 ## Limitations (v1)
@@ -99,8 +101,11 @@ just run
 - `strategy.same_block_attempt` attempts a pre-mine execution before waiting for the addLiquidity receipt; unresolved pairs still defer unless `dex.allow_execution_without_pair = true`.
 - `strategy.same_block_requires_reserves` requires non-zero pair reserves before same-block attempts (safer; defaults true).
 - `observability.log_format` controls log output format (`pretty` default, `json` for structured logs).
+- `observability.base_usd_price` and `observability.base_decimals` (optional) improve human-readable notifier PnL output; leave unset to disable USD formatting.
 - `sniper run` validates config (non-empty lists, address formats, bps bounds) and fails fast on invalid settings; it only warns (does not fail startup) if the private key env var or `executor.executor_contract` are missing (executions will be skipped).
 - `risk.sell_simulation_mode` (`strict`/`best_effort`) controls whether sell simulation must succeed; best-effort may skip tax checks on override or fee-on-transfer fallback.
 - `risk.sell_simulation_override_mode` (`detect`/`skip_any`) controls how override-related RPC errors are classified.
+- `risk.trading_control_check` enables paused/trading-enabled/start-time probes; `risk.trading_control_fail_closed` turns block-timestamp failures into high-severity rejects (default false).
+- `risk.max_tx_min_supply_bps` and `risk.max_wallet_min_supply_bps` enforce minimum maxTx/maxWallet as bps of total supply; `risk.max_cooldown_secs` caps transfer cooldown seconds (0 disables each).
 - Some Solidly routers (e.g. SwapX RouterV2) do not expose `WETH()/weth()` getters; rely on docs/on-chain transfer traces for the wrapped base token and include wS `0x039e2fB66102314Ce7b64Ce5Ce3E5183bc94aD38` in `dex.base_tokens`.
 - Solidly addLiquidity includes a `stable` flag; the bot carries this into pair resolution and execution.

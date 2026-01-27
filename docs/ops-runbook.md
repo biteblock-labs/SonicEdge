@@ -38,13 +38,19 @@ geth \
 - Keep `strategy.same_block_requires_reserves = true` to avoid pre-mine buys before reserves are set (safer default).
 - Set `strategy.emergency_reserve_drop_bps` to exit if reserves drop below the entry baseline (0 disables).
 - Set `strategy.emergency_sell_sim_failures` to exit after consecutive sell simulation failures (0 disables).
+- Set `strategy.buy_amount_mode` to `liquidity`, `fixed`, or `wallet_pct`, then tune `strategy.buy_amount_min`/`max` and `strategy.buy_amount_wallet_bps` to control per-trade sizing; for native-base buys, set `strategy.buy_amount_native_reserve` to keep gas available.
+- Set `strategy.position_log_interval_ms` to emit periodic position snapshots (entry/current price, TP/SL bands, PnL direction).
+- Set `strategy.buy_amount_unavailable_retry_ttl_ms` to cap retries after balance RPC errors (0 disables).
 - Set `observability.log_format` to `json` for structured logs (`pretty` default).
 - Set `dex.wrapped_native` (wS on Sonic) and include `0x0000000000000000000000000000000000000000` in `dex.base_tokens` to enable native-base execution.
 - Some Solidly routers (e.g. SwapX RouterV2) do not expose `WETH()/weth()` getters; verify the wrapped base token via docs or transfer traces (wS on Sonic mainnet).
 - Set `executor.executor_contract` to your deployed address.
+- Set `executor.gas_limit_buffer_bps` to add a safety margin to gas estimates (0 disables).
 - `sniper run` validates required lists, address formats, and bps bounds (invalid config fails fast); it only warns (does not fail startup) if the private key env var or `executor.executor_contract` are missing (executions will be skipped).
 - Keep `min_base_amount` in raw base units.
 - Set `risk.sell_simulation_mode` (`strict`/`best_effort`) and `risk.sell_simulation_override_mode` (`detect`/`skip_any`) to tune sell simulation enforcement.
+- Set `risk.trading_control_check = true` to reject tokens with paused/disabled trading or future start-time gates; `risk.trading_control_fail_closed = true` makes start-time failures fatal (default false).
+- Set `risk.max_tx_min_supply_bps`, `risk.max_wallet_min_supply_bps`, and `risk.max_cooldown_secs` to enforce maxTx/maxWallet/cooldown thresholds (0 disables each).
 - Use `risk.token_override_slots` to define non-standard ERC20 storage layouts (balance/allowance slots) so sell simulation and quote overrides work on tokens like USDC.
 
 ## Secrets
@@ -52,6 +58,13 @@ geth \
 
 ```
 SNIPER_PK=0x<hex_private_key>
+```
+
+- Optional: enable Telegram alerts:
+
+```
+TELEGRAM_BOT_TOKEN=<bot_token>
+TELEGRAM_CHAT_ID=<chat_id>
 ```
 
 - The CLI loads `.env` automatically. Prefer `0600` permissions (or a secrets manager) and reference it from systemd; never store private keys in config files or logs.
@@ -84,7 +97,31 @@ anvil --fork-url http://127.0.0.1:8545 --port 9555 --chain-id 146
 - Use a small set of test tokens to deterministically hit risk paths: standard ERC20, fee-on-transfer, honeypot/blacklist (revert on transfer), bad metadata (empty/long name/symbol), and a non-standard storage token (USDC-style).
 - Deploy tokens to the fork, mint to the LP account, then add liquidity via `scripts/submit_liquidity_eth.sh` (Shadow router).
 - Recommended risk settings for clear signals: `risk.sell_simulation_mode = "strict"`, `risk.sellability_amount_base = "1000000000000000"`, and `risk.max_tax_bps = 500`.
+- To exercise trading toggles and limit heuristics, enable `risk.trading_control_check = true` and set thresholds like `risk.max_tx_min_supply_bps = 200`, `risk.max_wallet_min_supply_bps = 300`, and `risk.max_cooldown_secs = 60`.
 - Expected outcomes: standard passes + buy/exit; fee-on-transfer rejected on tax; honeypot rejected on sell simulation; bad metadata rejected on ERC20 sanity; non-standard storage passes when `risk.token_override_slots` is configured.
+- Zoo limit tokens (ZOK/ZST/ZCD) are listed below with expected behavior and liquidity commands.
+
+### Zoo limit tokens (local Anvil)
+These are simple ERC20s with explicit limit getters so we can trigger the new maxTx/maxWallet/cooldown checks. They are deployed on the local Anvil fork; addresses reset when Anvil restarts.
+
+- ZOK (should pass): `0xfbC22278A96299D91d41C453234d97b4F5Eb9B2d`
+  - totalSupply=1e24, maxTx=5e22 (5%), maxWallet=1e23 (10%), cooldown=30s
+- ZST (should fail maxTx/maxWallet): `0x46b142DD1E924FAb83eCc3c08e4D46E82f005e0E`
+  - totalSupply=1e24, maxTx=5e21 (0.5%), maxWallet=1e22 (1%), cooldown=30s
+- ZCD (should fail cooldown): `0xC9a43158891282A2B1475592D5719c001986Aaec`
+  - totalSupply=1e24, maxTx=5e22 (5%), maxWallet=1e23 (10%), cooldown=120s
+
+Example liquidity adds (Shadow router):
+```
+export ROUTER=0x1D368773735ee1E678950B7A97bcA2CafB330CDc
+export WHALE=0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
+export TOKEN_AMOUNT=10000000000000000000000
+export ETH_AMOUNT=1000000000000000000
+
+TOKEN=0xfbC22278A96299D91d41C453234d97b4F5Eb9B2d scripts/submit_liquidity_eth.sh
+TOKEN=0x46b142DD1E924FAb83eCc3c08e4D46E82f005e0E scripts/submit_liquidity_eth.sh
+TOKEN=0xC9a43158891282A2B1475592D5719c001986Aaec scripts/submit_liquidity_eth.sh
+```
 
 ## Run
 ```

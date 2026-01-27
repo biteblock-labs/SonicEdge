@@ -1,12 +1,6 @@
-
 use crate::pair::{
-    contract_exists,
-    derive_pair_address_solidly,
-    derive_pair_address_v2,
-    get_pair_address,
-    get_pair_address_solidly,
-    get_pair_code_hash,
-    get_pair_tokens,
+    contract_exists, derive_pair_address_solidly, derive_pair_address_v2, get_pair_address,
+    get_pair_address_solidly, get_pair_code_hash, get_pair_tokens,
 };
 use alloy::primitives::{Address, B256};
 use alloy::providers::DynProvider;
@@ -143,7 +137,8 @@ impl PairMetadataCache {
 
             let pair = match stable {
                 Some(stable) => {
-                    match get_pair_address_solidly(provider, factory, token_a, token_b, stable).await
+                    match get_pair_address_solidly(provider, factory, token_a, token_b, stable)
+                        .await
                     {
                         Ok(pair) => pair,
                         Err(err) => {
@@ -540,7 +535,8 @@ mod tests {
         let token_b = address!("0x00000000000000000000000000000000000000bb");
         let init_code_hash =
             b256!("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
-        let mut cache = PairMetadataCache::new(2, 1000, 100, HashMap::from([(factory, init_code_hash)]));
+        let mut cache =
+            PairMetadataCache::new(2, 1000, 100, HashMap::from([(factory, init_code_hash)]));
         let provider = ProviderBuilder::new()
             .connect_mocked_client(Asserter::new())
             .erased();

@@ -3799,8 +3799,10 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "anyhow",
+ "futures-util",
  "lru 0.12.5",
  "prometheus",
+ "reqwest",
  "serde",
  "serde_json",
  "sonic-chain",

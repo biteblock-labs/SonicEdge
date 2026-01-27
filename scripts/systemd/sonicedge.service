@@ -1,0 +1,22 @@
+[Unit]
+Description=SonicEdge mempool sniper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/bot/SonicEdge
+EnvironmentFile=/home/ubuntu/bot/SonicEdge/.env
+ExecStart=/home/ubuntu/bot/SonicEdge/target/release/sniper run --config /home/ubuntu/bot/SonicEdge/config/sonic.alchemy.toml
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/home/ubuntu/bot/SonicEdge/logs /home/ubuntu/bot/SonicEdge/state
+
+[Install]
+WantedBy=multi-user.target

@@ -1,12 +1,8 @@
 use crate::abi::{
-    IFactoryInitCodeHash,
-    IFactoryPairCodeHash,
-    ISolidlyFactory,
-    IUniswapV2Factory,
-    IUniswapV2Pair,
+    IFactoryInitCodeHash, IFactoryPairCodeHash, ISolidlyFactory, IUniswapV2Factory, IUniswapV2Pair,
 };
 use alloy::eips::BlockId;
-use alloy::primitives::{keccak256, Address, B256, TxKind, U256};
+use alloy::primitives::{keccak256, Address, TxKind, B256, U256};
 use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::transaction::TransactionInput;
 use alloy::rpc::types::TransactionRequest;

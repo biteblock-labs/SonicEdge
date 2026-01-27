@@ -21,7 +21,10 @@ impl ChannelMetrics {
         registry.register(Box::new(queue_depth.clone()))?;
         registry.register(Box::new(dropped_total.clone()))?;
 
-        Ok(Self { queue_depth, dropped_total })
+        Ok(Self {
+            queue_depth,
+            dropped_total,
+        })
     }
 
     pub fn set_queue_depth(&self, depth: usize) {

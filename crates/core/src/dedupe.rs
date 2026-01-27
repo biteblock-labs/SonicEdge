@@ -13,7 +13,10 @@ where
 {
     pub fn new(capacity: usize, ttl_ms: u64) -> Self {
         let capacity = NonZeroUsize::new(capacity.max(1)).unwrap();
-        Self { ttl_ms, cache: LruCache::new(capacity) }
+        Self {
+            ttl_ms,
+            cache: LruCache::new(capacity),
+        }
     }
 
     pub fn check_and_update(&mut self, key: K, now_ms: u64) -> bool {

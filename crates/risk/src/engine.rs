@@ -1,20 +1,24 @@
-use alloy::primitives::{address, keccak256, Address, B256, TxKind, U256};
+use alloy::eips::BlockId;
+use alloy::primitives::{address, keccak256, Address, TxKind, B256, U256};
 use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::state::{AccountOverride, StateOverride, StateOverridesBuilder};
 use alloy::rpc::types::transaction::TransactionInput;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use sonic_core::config::RiskConfig;
+use sonic_core::modes::{SellSimulationMode, SellSimulationOverrideMode};
 use sonic_core::utils::{parse_address, parse_u256_decimal};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use crate::abi::{IERC20, ISolidlyRouter, IUniswapV2Router02, Route};
+use crate::abi::{ISolidlyRouter, IUniswapV2Router02, Route, IERC20};
 use crate::types::RiskDecision;
 
 struct RiskFinding {
@@ -38,6 +42,39 @@ const ERC20_BALANCES_SLOT: u64 = 0;
 const ERC20_ALLOWANCES_SLOT: u64 = 1;
 const SIMULATION_DEADLINE_SECS: u64 = 10_000_000_000;
 const SIMULATION_SENDER: Address = address!("0x1111111111111111111111111111111111111111");
+const TRADING_ENABLED_SIGS: [&str; 4] = [
+    "tradingEnabled()",
+    "tradingActive()",
+    "isTradingEnabled()",
+    "isTradingActive()",
+];
+const TRADING_PAUSED_SIGS: [&str; 2] = ["paused()", "isPaused()"];
+const TRADING_START_TIME_SIGS: [&str; 3] =
+    ["launchTime()", "tradingStartTime()", "startTradingTime()"];
+const TRADING_CONTROL_PROBE_SIG: &str = "sonicEdgeTradingProbe()";
+const MAX_TX_SIGS: [&str; 5] = [
+    "maxTxAmount()",
+    "maxTransactionAmount()",
+    "maxTx()",
+    "maxTransaction()",
+    "_maxTxAmount()",
+];
+const MAX_WALLET_SIGS: [&str; 4] = [
+    "maxWalletAmount()",
+    "maxWallet()",
+    "maxWalletSize()",
+    "_maxWalletSize()",
+];
+const COOLDOWN_SECS_SIGS: [&str; 5] = [
+    "cooldownTime()",
+    "cooldownSeconds()",
+    "cooldownDuration()",
+    "cooldownPeriod()",
+    "transferDelaySeconds()",
+];
+const OVERRIDE_SLOT_PROBE_MAX: u64 = 10;
+const OVERRIDE_PROBE_BALANCE: u64 = 0x11_22_33_44_55_66_77_88;
+const OVERRIDE_PROBE_ALLOWANCE: u64 = 0x99_AA_BB_CC_DD_EE_FF_00;
 
 #[derive(Clone, Copy)]
 struct TokenOverrideSlots {
@@ -60,6 +97,7 @@ pub struct RiskEngine {
     sell_simulation_mode: SellSimulationMode,
     sell_simulation_override_mode: SellSimulationOverrideMode,
     token_override_slots: HashMap<Address, TokenOverrideSlots>,
+    discovered_override_slots: Arc<Mutex<HashMap<Address, TokenOverrideSlots>>>,
 }
 
 enum SellSimulationResult {
@@ -75,40 +113,6 @@ pub struct RiskContext<'a> {
     pub pair: Option<Address>,
     pub stable: Option<bool>,
     pub sellability_enabled: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SellSimulationMode {
-    Strict,
-    BestEffort,
-}
-
-impl SellSimulationMode {
-    fn parse(raw: &str) -> Result<Self> {
-        let normalized = raw.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "strict" => Ok(Self::Strict),
-            "best_effort" | "best-effort" | "besteffort" => Ok(Self::BestEffort),
-            _ => bail!("unsupported sell_simulation_mode: {raw}"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SellSimulationOverrideMode {
-    Detect,
-    SkipAny,
-}
-
-impl SellSimulationOverrideMode {
-    fn parse(raw: &str) -> Result<Self> {
-        let normalized = raw.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "detect" => Ok(Self::Detect),
-            "skip_any" | "skip-any" | "skipany" => Ok(Self::SkipAny),
-            _ => bail!("unsupported sell_simulation_override_mode: {raw}"),
-        }
-    }
 }
 
 impl RiskEngine {
@@ -136,6 +140,7 @@ impl RiskEngine {
             sell_simulation_mode,
             sell_simulation_override_mode,
             token_override_slots,
+            discovered_override_slots: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -143,13 +148,12 @@ impl RiskEngine {
         let mut findings = Vec::new();
 
         if ctx.base_token == ctx.token {
-            findings.push(RiskFinding::new(
-                "token matches base token",
-                SCORE_FATAL,
-            ));
+            findings.push(RiskFinding::new("token matches base token", SCORE_FATAL));
         }
 
         findings.extend(self.check_erc20_sanity(ctx).await);
+        findings.extend(self.check_trading_controls(ctx).await);
+        findings.extend(self.check_limit_controls(ctx).await);
         findings.extend(self.check_sellability_and_tax(ctx).await);
 
         if findings.is_empty() {
@@ -158,10 +162,7 @@ impl RiskEngine {
             let score = findings
                 .iter()
                 .fold(0u32, |acc, finding| acc.saturating_add(finding.score));
-            let reasons: Vec<String> = findings
-                .into_iter()
-                .map(|finding| finding.reason)
-                .collect();
+            let reasons: Vec<String> = findings.into_iter().map(|finding| finding.reason).collect();
             debug!(score, ?reasons, "risk reject");
             Ok(RiskDecision {
                 pass: false,
@@ -187,10 +188,7 @@ impl RiskEngine {
         };
 
         if code.is_empty() {
-            findings.push(RiskFinding::new(
-                "token has no contract code",
-                SCORE_FATAL,
-            ));
+            findings.push(RiskFinding::new("token has no contract code", SCORE_FATAL));
             return findings;
         }
 
@@ -213,6 +211,157 @@ impl RiskEngine {
         }
         if let Err(reason) = self.erc20_symbol(ctx).await {
             findings.push(RiskFinding::new(reason, SCORE_MEDIUM));
+        }
+
+        findings
+    }
+
+    async fn check_trading_controls(&self, ctx: &RiskContext<'_>) -> Vec<RiskFinding> {
+        if !self.cfg.trading_control_check {
+            return Vec::new();
+        }
+        let mut findings = Vec::new();
+        let probe_value = self.try_call_u256(ctx, TRADING_CONTROL_PROBE_SIG).await;
+
+        if let Some((signature, paused)) = self
+            .first_bool_flag(ctx, &TRADING_PAUSED_SIGS, probe_value)
+            .await
+        {
+            if paused {
+                findings.push(RiskFinding::new(
+                    format!("token paused via {signature}"),
+                    SCORE_HIGH,
+                ));
+                return findings;
+            }
+        }
+
+        if let Some((signature, enabled)) = self
+            .first_bool_flag(ctx, &TRADING_ENABLED_SIGS, probe_value)
+            .await
+        {
+            if !enabled {
+                findings.push(RiskFinding::new(
+                    format!("trading disabled via {signature}"),
+                    SCORE_HIGH,
+                ));
+                return findings;
+            }
+        }
+
+        if let Some((signature, start_time)) = self
+            .first_value_flag(ctx, &TRADING_START_TIME_SIGS, probe_value)
+            .await
+        {
+            if !start_time.is_zero() {
+                match self.latest_block_timestamp(ctx).await {
+                    Ok(now) => {
+                        let now_u256 = U256::from(now);
+                        if now_u256 < start_time {
+                            findings.push(RiskFinding::new(
+                                format!(
+                                    "trading not started (start_time={start_time} now={now_u256} via {signature})"
+                                ),
+                                SCORE_HIGH,
+                            ));
+                        }
+                    }
+                    Err(reason) => {
+                        if self.cfg.trading_control_fail_closed {
+                            findings.push(RiskFinding::new(
+                                format!(
+                                    "trading start-time check failed ({reason}) via {signature}"
+                                ),
+                                SCORE_HIGH,
+                            ));
+                        } else {
+                            warn!(
+                                reason = %reason,
+                                signature = %signature,
+                                "trading start-time check skipped"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        findings
+    }
+
+    async fn check_limit_controls(&self, ctx: &RiskContext<'_>) -> Vec<RiskFinding> {
+        let max_tx_min_bps = self.cfg.max_tx_min_supply_bps;
+        let max_wallet_min_bps = self.cfg.max_wallet_min_supply_bps;
+        let max_cooldown_secs = self.cfg.max_cooldown_secs;
+        if max_tx_min_bps == 0 && max_wallet_min_bps == 0 && max_cooldown_secs == 0 {
+            return Vec::new();
+        }
+
+        let mut findings = Vec::new();
+        let probe_value = self.try_call_u256(ctx, TRADING_CONTROL_PROBE_SIG).await;
+        let total_supply = if max_tx_min_bps > 0 || max_wallet_min_bps > 0 {
+            match self.erc20_total_supply(ctx).await {
+                Ok(supply) if !supply.is_zero() => Some(supply),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(total_supply) = total_supply {
+            if max_tx_min_bps > 0 {
+                if let Some((signature, value)) =
+                    self.min_flag_value(ctx, &MAX_TX_SIGS, probe_value).await
+                {
+                    if let Some(threshold) = limit_threshold(total_supply, max_tx_min_bps) {
+                        if !value.is_zero() && value < threshold {
+                            let limit_bps = limit_bps(value, total_supply);
+                            findings.push(RiskFinding::new(
+                                format!(
+                                    "max tx too low: {value} ({limit_bps} bps of supply) via {signature}"
+                                ),
+                                SCORE_HIGH,
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if max_wallet_min_bps > 0 {
+                if let Some((signature, value)) = self
+                    .min_flag_value(ctx, &MAX_WALLET_SIGS, probe_value)
+                    .await
+                {
+                    if let Some(threshold) = limit_threshold(total_supply, max_wallet_min_bps) {
+                        if !value.is_zero() && value < threshold {
+                            let limit_bps = limit_bps(value, total_supply);
+                            findings.push(RiskFinding::new(
+                                format!(
+                                    "max wallet too low: {value} ({limit_bps} bps of supply) via {signature}"
+                                ),
+                                SCORE_HIGH,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if max_cooldown_secs > 0 {
+            let max_cooldown = U256::from(max_cooldown_secs);
+            if let Some((signature, value)) = self
+                .max_flag_value(ctx, &COOLDOWN_SECS_SIGS, probe_value)
+                .await
+            {
+                if !value.is_zero() && value > max_cooldown {
+                    findings.push(RiskFinding::new(
+                        format!(
+                            "cooldown too long: {value}s (max {max_cooldown_secs}s) via {signature}"
+                        ),
+                        SCORE_HIGH,
+                    ));
+                }
+            }
         }
 
         findings
@@ -354,6 +503,139 @@ impl RiskEngine {
         findings
     }
 
+    async fn first_bool_flag(
+        &self,
+        ctx: &RiskContext<'_>,
+        signatures: &[&'static str],
+        probe_value: Option<U256>,
+    ) -> Option<(&'static str, bool)> {
+        for signature in signatures {
+            if let Some(value) = self.try_call_u256(ctx, signature).await {
+                if value > U256::from(1u64) {
+                    continue;
+                }
+                if is_probable_fallback(value, probe_value) {
+                    continue;
+                }
+                return Some((*signature, !value.is_zero()));
+            }
+        }
+        None
+    }
+
+    async fn first_value_flag(
+        &self,
+        ctx: &RiskContext<'_>,
+        signatures: &[&'static str],
+        probe_value: Option<U256>,
+    ) -> Option<(&'static str, U256)> {
+        for signature in signatures {
+            if let Some(value) = self.try_call_u256(ctx, signature).await {
+                if is_probable_fallback(value, probe_value) {
+                    continue;
+                }
+                return Some((*signature, value));
+            }
+        }
+        None
+    }
+
+    async fn min_flag_value(
+        &self,
+        ctx: &RiskContext<'_>,
+        signatures: &[&'static str],
+        probe_value: Option<U256>,
+    ) -> Option<(&'static str, U256)> {
+        let mut best: Option<(&'static str, U256)> = None;
+        for signature in signatures {
+            if let Some(value) = self.try_call_u256(ctx, signature).await {
+                if value.is_zero() {
+                    continue;
+                }
+                if is_probable_fallback(value, probe_value) {
+                    continue;
+                }
+                match best {
+                    None => best = Some((*signature, value)),
+                    Some((_, best_value)) if value < best_value => best = Some((*signature, value)),
+                    _ => {}
+                }
+            }
+        }
+        best
+    }
+
+    async fn max_flag_value(
+        &self,
+        ctx: &RiskContext<'_>,
+        signatures: &[&'static str],
+        probe_value: Option<U256>,
+    ) -> Option<(&'static str, U256)> {
+        let mut best: Option<(&'static str, U256)> = None;
+        for signature in signatures {
+            if let Some(value) = self.try_call_u256(ctx, signature).await {
+                if value.is_zero() {
+                    continue;
+                }
+                if is_probable_fallback(value, probe_value) {
+                    continue;
+                }
+                match best {
+                    None => best = Some((*signature, value)),
+                    Some((_, best_value)) if value > best_value => best = Some((*signature, value)),
+                    _ => {}
+                }
+            }
+        }
+        best
+    }
+
+    async fn try_call_u256(&self, ctx: &RiskContext<'_>, signature: &str) -> Option<U256> {
+        let selector = selector(signature);
+        let tx = TransactionRequest {
+            to: Some(TxKind::Call(ctx.token)),
+            input: TransactionInput::new(selector.to_vec().into()),
+            ..Default::default()
+        };
+        let data = match self
+            .with_timeout(signature, async { ctx.provider.call(tx).await })
+            .await
+        {
+            Ok(data) => data,
+            Err(_) => return None,
+        };
+        if data.len() < 32 {
+            return None;
+        }
+        Some(U256::from_be_slice(&data[..32]))
+    }
+
+    async fn latest_block_timestamp(&self, ctx: &RiskContext<'_>) -> Result<u64, String> {
+        let block = self
+            .with_timeout("latest block", async {
+                ctx.provider.get_block(BlockId::latest()).await
+            })
+            .await?;
+        match block {
+            Some(block) => Ok(block.header.timestamp),
+            None => Err("latest block unavailable".to_string()),
+        }
+    }
+
+    async fn erc20_total_supply(&self, ctx: &RiskContext<'_>) -> Result<U256, String> {
+        let call = IERC20::totalSupplyCall {};
+        let tx = TransactionRequest {
+            to: Some(TxKind::Call(ctx.token)),
+            input: TransactionInput::new(call.abi_encode().into()),
+            ..Default::default()
+        };
+        let data = self
+            .with_timeout("token totalSupply", async { ctx.provider.call(tx).await })
+            .await?;
+        IERC20::totalSupplyCall::abi_decode_returns(&data)
+            .map_err(|err| format!("token totalSupply decode failed: {err}"))
+    }
+
     async fn erc20_decimals(&self, ctx: &RiskContext<'_>) -> Result<u8, String> {
         let call = IERC20::decimalsCall {};
         let tx = TransactionRequest {
@@ -428,30 +710,142 @@ impl RiskEngine {
                 ..Default::default()
             };
             let data = self
-                .with_timeout("router getAmountsOut", async { ctx.provider.call(tx).await })
+                .with_timeout("router getAmountsOut", async {
+                    ctx.provider.call(tx).await
+                })
                 .await?;
             ISolidlyRouter::getAmountsOutCall::abi_decode_returns(&data)
                 .map_err(|err| format!("router getAmountsOut decode failed: {err}"))
         } else {
-            let call = IUniswapV2Router02::getAmountsOutCall { amountIn: amount_in, path };
+            let call = IUniswapV2Router02::getAmountsOutCall {
+                amountIn: amount_in,
+                path,
+            };
             let tx = TransactionRequest {
                 to: Some(TxKind::Call(ctx.router)),
                 input: TransactionInput::new(call.abi_encode().into()),
                 ..Default::default()
             };
             let data = self
-                .with_timeout("router getAmountsOut", async { ctx.provider.call(tx).await })
+                .with_timeout("router getAmountsOut", async {
+                    ctx.provider.call(tx).await
+                })
                 .await?;
             IUniswapV2Router02::getAmountsOutCall::abi_decode_returns(&data)
                 .map_err(|err| format!("router getAmountsOut decode failed: {err}"))
         }
     }
 
-    fn override_slots(&self, token: Address) -> TokenOverrideSlots {
-        self.token_override_slots
+    async fn override_slots(&self, token: Address) -> TokenOverrideSlots {
+        if let Some(slots) = self.token_override_slots.get(&token).copied() {
+            return slots;
+        }
+        let cache = self.discovered_override_slots.lock().await;
+        cache
             .get(&token)
             .copied()
             .unwrap_or(TokenOverrideSlots::DEFAULT)
+    }
+
+    async fn cache_override_slots(&self, token: Address, slots: TokenOverrideSlots) {
+        let mut cache = self.discovered_override_slots.lock().await;
+        cache.insert(token, slots);
+    }
+
+    async fn probe_override_slots(&self, ctx: &RiskContext<'_>) -> Option<TokenOverrideSlots> {
+        if self.token_override_slots.contains_key(&ctx.token) {
+            return None;
+        }
+        {
+            let cache = self.discovered_override_slots.lock().await;
+            if let Some(slots) = cache.get(&ctx.token).copied() {
+                return Some(slots);
+            }
+        }
+
+        let balance_slot = self
+            .probe_balance_slot(ctx, U256::from(OVERRIDE_PROBE_BALANCE))
+            .await?;
+        let allowance_slot = self
+            .probe_allowance_slot(ctx, U256::from(OVERRIDE_PROBE_ALLOWANCE))
+            .await?;
+        let slots = TokenOverrideSlots {
+            balance_slot,
+            allowance_slot,
+        };
+        self.cache_override_slots(ctx.token, slots).await;
+        info!(
+            token = %ctx.token,
+            balance_slot,
+            allowance_slot,
+            "risk override slots resolved"
+        );
+        Some(slots)
+    }
+
+    async fn probe_balance_slot(&self, ctx: &RiskContext<'_>, sentinel: U256) -> Option<u64> {
+        let call = IERC20::balanceOfCall {
+            account: SIMULATION_SENDER,
+        };
+        let tx = TransactionRequest {
+            to: Some(TxKind::Call(ctx.token)),
+            input: TransactionInput::new(call.abi_encode().into()),
+            ..Default::default()
+        };
+        for slot in 0..=OVERRIDE_SLOT_PROBE_MAX {
+            let balance_slot = mapping_slot(SIMULATION_SENDER, slot);
+            let overrides = StateOverridesBuilder::default()
+                .append(
+                    ctx.token,
+                    AccountOverride::default()
+                        .with_state_diff([(balance_slot, B256::from(sentinel))]),
+                )
+                .build();
+            let data = self
+                .with_timeout("token balance probe", async {
+                    ctx.provider.call(tx.clone()).overrides(overrides).await
+                })
+                .await
+                .ok()?;
+            let balance = IERC20::balanceOfCall::abi_decode_returns(&data).ok()?;
+            if balance == sentinel {
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    async fn probe_allowance_slot(&self, ctx: &RiskContext<'_>, sentinel: U256) -> Option<u64> {
+        let call = IERC20::allowanceCall {
+            owner: SIMULATION_SENDER,
+            spender: ctx.router,
+        };
+        let tx = TransactionRequest {
+            to: Some(TxKind::Call(ctx.token)),
+            input: TransactionInput::new(call.abi_encode().into()),
+            ..Default::default()
+        };
+        for slot in 0..=OVERRIDE_SLOT_PROBE_MAX {
+            let allowance_slot = double_mapping_slot(SIMULATION_SENDER, ctx.router, slot);
+            let overrides = StateOverridesBuilder::default()
+                .append(
+                    ctx.token,
+                    AccountOverride::default()
+                        .with_state_diff([(allowance_slot, B256::from(sentinel))]),
+                )
+                .build();
+            let data = self
+                .with_timeout("token allowance probe", async {
+                    ctx.provider.call(tx.clone()).overrides(overrides).await
+                })
+                .await
+                .ok()?;
+            let allowance = IERC20::allowanceCall::abi_decode_returns(&data).ok()?;
+            if allowance == sentinel {
+                return Some(slot);
+            }
+        }
+        None
     }
 
     async fn simulate_sell(
@@ -487,17 +881,50 @@ impl RiskEngine {
             input: TransactionInput::new(call.abi_encode().into()),
             ..Default::default()
         };
-        let slots = self.override_slots(ctx.token);
+        let slots = self.override_slots(ctx.token).await;
         let overrides =
             sell_simulation_overrides(ctx.token, SIMULATION_SENDER, ctx.router, amount_in, slots);
         let data = self
             .with_timeout("router swapExactTokensForTokens (simulated)", async {
-                ctx.provider.call(tx).overrides(overrides).await
+                ctx.provider.call(tx.clone()).overrides(overrides).await
             })
             .await;
         let data = match data {
             Ok(data) => data,
-            Err(reason) => {
+            Err(mut reason) => {
+                if is_probable_override_mismatch(&reason) {
+                    if let Some(slots) = self.probe_override_slots(ctx).await {
+                        let overrides = sell_simulation_overrides(
+                            ctx.token,
+                            SIMULATION_SENDER,
+                            ctx.router,
+                            amount_in,
+                            slots,
+                        );
+                        match self
+                            .with_timeout("router swapExactTokensForTokens (simulated)", async {
+                                ctx.provider.call(tx.clone()).overrides(overrides).await
+                            })
+                            .await
+                        {
+                            Ok(data) => {
+                                let amounts = IUniswapV2Router02::swapExactTokensForTokensCall::abi_decode_returns(&data)
+                                    .map_err(|err| format!("router swapExactTokensForTokens decode failed: {err}"))?;
+                                if amounts.len() < 2 {
+                                    return Err(
+                                        "router swap returned insufficient hop count".to_string()
+                                    );
+                                }
+                                return Ok(SellSimulationResult::Amount(
+                                    amounts[amounts.len() - 1],
+                                ));
+                            }
+                            Err(retry_reason) => {
+                                reason = retry_reason;
+                            }
+                        }
+                    }
+                }
                 if self.sell_simulation_mode == SellSimulationMode::BestEffort
                     && is_fee_on_transfer_revert(&reason)
                 {
@@ -535,8 +962,9 @@ impl RiskEngine {
                 return Err(reason);
             }
         };
-        let amounts = IUniswapV2Router02::swapExactTokensForTokensCall::abi_decode_returns(&data)
-            .map_err(|err| format!("router swapExactTokensForTokens decode failed: {err}"))?;
+        let amounts =
+            IUniswapV2Router02::swapExactTokensForTokensCall::abi_decode_returns(&data)
+                .map_err(|err| format!("router swapExactTokensForTokens decode failed: {err}"))?;
         if amounts.len() < 2 {
             return Err("router swap returned insufficient hop count".to_string());
         }
@@ -564,17 +992,50 @@ impl RiskEngine {
             input: TransactionInput::new(call.abi_encode().into()),
             ..Default::default()
         };
-        let slots = self.override_slots(ctx.token);
+        let slots = self.override_slots(ctx.token).await;
         let overrides =
             sell_simulation_overrides(ctx.token, SIMULATION_SENDER, ctx.router, amount_in, slots);
         let data = self
             .with_timeout("router swapExactTokensForTokens (simulated)", async {
-                ctx.provider.call(tx).overrides(overrides).await
+                ctx.provider.call(tx.clone()).overrides(overrides).await
             })
             .await;
         let data = match data {
             Ok(data) => data,
-            Err(reason) => {
+            Err(mut reason) => {
+                if is_probable_override_mismatch(&reason) {
+                    if let Some(slots) = self.probe_override_slots(ctx).await {
+                        let overrides = sell_simulation_overrides(
+                            ctx.token,
+                            SIMULATION_SENDER,
+                            ctx.router,
+                            amount_in,
+                            slots,
+                        );
+                        match self
+                            .with_timeout("router swapExactTokensForTokens (simulated)", async {
+                                ctx.provider.call(tx.clone()).overrides(overrides).await
+                            })
+                            .await
+                        {
+                            Ok(data) => {
+                                let amounts = ISolidlyRouter::swapExactTokensForTokensCall::abi_decode_returns(&data)
+                                    .map_err(|err| format!("router swapExactTokensForTokens decode failed: {err}"))?;
+                                if amounts.len() < 2 {
+                                    return Err(
+                                        "router swap returned insufficient hop count".to_string()
+                                    );
+                                }
+                                return Ok(SellSimulationResult::Amount(
+                                    amounts[amounts.len() - 1],
+                                ));
+                            }
+                            Err(retry_reason) => {
+                                reason = retry_reason;
+                            }
+                        }
+                    }
+                }
                 if self.sell_simulation_mode == SellSimulationMode::BestEffort
                     && is_fee_on_transfer_revert(&reason)
                 {
@@ -607,35 +1068,58 @@ impl RiskEngine {
         amount_in: U256,
         path: Vec<Address>,
     ) -> Result<(), String> {
-        let call =
-            IUniswapV2Router02::swapExactTokensForTokensSupportingFeeOnTransferTokensCall {
-                amountIn: amount_in,
-                amountOutMin: U256::from(0u64),
-                path,
-                to: SIMULATION_SENDER,
-                deadline: U256::from(SIMULATION_DEADLINE_SECS),
-            };
+        let call = IUniswapV2Router02::swapExactTokensForTokensSupportingFeeOnTransferTokensCall {
+            amountIn: amount_in,
+            amountOutMin: U256::from(0u64),
+            path,
+            to: SIMULATION_SENDER,
+            deadline: U256::from(SIMULATION_DEADLINE_SECS),
+        };
         let tx = TransactionRequest {
             from: Some(SIMULATION_SENDER),
             to: Some(TxKind::Call(ctx.router)),
             input: TransactionInput::new(call.abi_encode().into()),
             ..Default::default()
         };
-        let slots = self.override_slots(ctx.token);
+        let slots = self.override_slots(ctx.token).await;
         let overrides =
             sell_simulation_overrides(ctx.token, SIMULATION_SENDER, ctx.router, amount_in, slots);
-        self.with_timeout(
-            "router swapExactTokensForTokensSupportingFeeOnTransferTokens (simulated)",
-            async { ctx.provider.call(tx).overrides(overrides).await },
-        )
-        .await?;
-        Ok(())
+        match self
+            .with_timeout(
+                "router swapExactTokensForTokensSupportingFeeOnTransferTokens (simulated)",
+                async { ctx.provider.call(tx.clone()).overrides(overrides).await },
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(mut reason) => {
+                if is_probable_override_mismatch(&reason) {
+                    if let Some(slots) = self.probe_override_slots(ctx).await {
+                        let overrides = sell_simulation_overrides(
+                            ctx.token,
+                            SIMULATION_SENDER,
+                            ctx.router,
+                            amount_in,
+                            slots,
+                        );
+                        match self
+                            .with_timeout(
+                                "router swapExactTokensForTokensSupportingFeeOnTransferTokens (simulated)",
+                                async { ctx.provider.call(tx.clone()).overrides(overrides).await },
+                            )
+                            .await
+                        {
+                            Ok(_) => return Ok(()),
+                            Err(retry_reason) => reason = retry_reason,
+                        }
+                    }
+                }
+                Err(reason)
+            }
+        }
     }
 
-    fn solidly_routes_from_path(
-        path: &[Address],
-        stable: bool,
-    ) -> Result<Vec<Route>, String> {
+    fn solidly_routes_from_path(path: &[Address], stable: bool) -> Result<Vec<Route>, String> {
         if path.len() < 2 {
             return Err("router path must include at least two tokens".to_string());
         }
@@ -683,6 +1167,20 @@ impl RiskEngine {
             )),
         }
     }
+}
+
+fn limit_threshold(total_supply: U256, min_bps: u32) -> Option<U256> {
+    if total_supply.is_zero() || min_bps == 0 {
+        return None;
+    }
+    Some(total_supply.saturating_mul(U256::from(min_bps as u64)) / U256::from(10_000u64))
+}
+
+fn limit_bps(limit: U256, total_supply: U256) -> U256 {
+    if total_supply.is_zero() {
+        return U256::ZERO;
+    }
+    limit.saturating_mul(U256::from(10_000u64)) / total_supply
 }
 
 fn loss_bps(amount_in: U256, amount_out: U256) -> Option<U256> {
@@ -775,6 +1273,36 @@ fn is_probable_override_error(reason: &str) -> bool {
     patterns.iter().any(|pattern| lower.contains(pattern))
 }
 
+fn is_probable_override_mismatch(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    if is_empty_revert(&lower) {
+        return true;
+    }
+    let has_balance = lower.contains("balance");
+    let has_allowance = lower.contains("allowance");
+    if (has_balance || has_allowance)
+        && (lower.contains("insufficient") || lower.contains("exceed"))
+    {
+        return true;
+    }
+    if lower.contains("transfer amount exceeds balance")
+        || lower.contains("transfer amount exceeds allowance")
+        || lower.contains("insufficient funds")
+    {
+        return true;
+    }
+    false
+}
+
+fn is_empty_revert(lower_reason: &str) -> bool {
+    if !lower_reason.contains("execution reverted") {
+        return false;
+    }
+    lower_reason.contains("data: \"0x\"")
+        || lower_reason.contains("data: 0x")
+        || lower_reason.contains("data:0x")
+}
+
 fn is_fee_on_transfer_revert(reason: &str) -> bool {
     let upper = reason.to_ascii_uppercase();
     if upper.contains("INSUFFICIENT_INPUT_AMOUNT") {
@@ -798,10 +1326,22 @@ fn double_mapping_slot(owner: Address, spender: Address, slot: u64) -> B256 {
     keccak256(buf)
 }
 
+fn is_probable_fallback(value: U256, probe_value: Option<U256>) -> bool {
+    probe_value.map_or(false, |probe| probe == value)
+}
+
+fn selector(signature: &str) -> [u8; 4] {
+    let hash = keccak256(signature.as_bytes());
+    let mut selector = [0u8; 4];
+    selector.copy_from_slice(&hash.0[..4]);
+    selector
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        is_tax_excessive, loss_bps, RiskContext, RiskEngine, SCORE_HIGH, SCORE_MEDIUM,
+        is_tax_excessive, loss_bps, RiskContext, RiskEngine, MAX_TX_SIGS, MAX_WALLET_SIGS,
+        SCORE_HIGH, SCORE_MEDIUM,
     };
     use alloy::primitives::{address, Bytes, Uint, U256};
     use alloy::providers::{Provider, ProviderBuilder};
@@ -809,7 +1349,7 @@ mod tests {
     use alloy::transports::mock::Asserter;
     use sonic_core::config::RiskConfig;
 
-    use crate::abi::{IERC20, ISolidlyRouter, IUniswapV2Pair, IUniswapV2Router02};
+    use crate::abi::{ISolidlyRouter, IUniswapV2Pair, IUniswapV2Router02, IERC20};
 
     #[test]
     fn loss_bps_zero_on_gain() {
@@ -840,6 +1380,11 @@ mod tests {
             sellability_amount_base: "1000".to_string(),
             max_tax_bps: 100,
             erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
@@ -897,9 +1442,10 @@ mod tests {
         let decision = engine.assess(&ctx).await.unwrap();
         assert!(!decision.pass);
         assert!(decision.score >= SCORE_HIGH);
-        assert!(decision.reasons.iter().any(|reason| {
-            reason.contains("tax estimate too high (expected vs simulated)")
-        }));
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| { reason.contains("tax estimate too high (expected vs simulated)") }));
         assert!(asserter.read_q().is_empty());
     }
 
@@ -913,6 +1459,11 @@ mod tests {
             sellability_amount_base: "0".to_string(),
             max_tax_bps: 100,
             erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
@@ -947,6 +1498,412 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assess_rejects_when_paused_flag_set() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "0".to_string(),
+            max_tax_bps: 100,
+            erc20_call_timeout_ms: 500,
+            trading_control_check: true,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
+            sell_simulation_mode: "strict".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: None,
+            stable: None,
+            sellability_enabled: true,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"TestToken".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TST".to_string()),
+        );
+        asserter.push_failure_msg("probe revert");
+        push_bytes(&asserter, U256::from(1u64).to_be_bytes::<32>().to_vec());
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(!decision.pass);
+        assert!(decision.score >= SCORE_HIGH);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("token paused via paused()")));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assess_rejects_when_trading_disabled_flag_set() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "0".to_string(),
+            max_tax_bps: 100,
+            erc20_call_timeout_ms: 500,
+            trading_control_check: true,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
+            sell_simulation_mode: "strict".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: None,
+            stable: None,
+            sellability_enabled: true,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"TestToken".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TST".to_string()),
+        );
+        asserter.push_failure_msg("probe revert");
+        push_bytes(&asserter, U256::from(0u64).to_be_bytes::<32>().to_vec());
+        push_bytes(&asserter, U256::from(0u64).to_be_bytes::<32>().to_vec());
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(!decision.pass);
+        assert!(decision.score >= SCORE_HIGH);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("trading disabled via tradingEnabled()")));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assess_rejects_when_trading_not_started() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "0".to_string(),
+            max_tax_bps: 100,
+            erc20_call_timeout_ms: 500,
+            trading_control_check: true,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
+            sell_simulation_mode: "strict".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: None,
+            stable: None,
+            sellability_enabled: true,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"TestToken".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TST".to_string()),
+        );
+        asserter.push_failure_msg("probe revert");
+        asserter.push_failure_msg("paused revert");
+        asserter.push_failure_msg("isPaused revert");
+        asserter.push_failure_msg("tradingEnabled revert");
+        asserter.push_failure_msg("tradingActive revert");
+        asserter.push_failure_msg("isTradingEnabled revert");
+        asserter.push_failure_msg("isTradingActive revert");
+        push_bytes(&asserter, U256::from(200u64).to_be_bytes::<32>().to_vec());
+
+        let mut block: alloy::rpc::types::Block = Default::default();
+        block.header.inner.timestamp = 100;
+        asserter.push_success(&Some(block));
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(!decision.pass);
+        assert!(decision.score >= SCORE_HIGH);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("trading not started")));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assess_skips_trading_flags_when_probe_matches() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "0".to_string(),
+            max_tax_bps: 100,
+            erc20_call_timeout_ms: 500,
+            trading_control_check: true,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
+            sell_simulation_mode: "strict".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: None,
+            stable: None,
+            sellability_enabled: true,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"TestToken".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TST".to_string()),
+        );
+        let probe_value = U256::from(1u64).to_be_bytes::<32>().to_vec();
+        push_bytes(&asserter, probe_value.clone());
+        push_bytes(&asserter, probe_value.clone());
+        push_bytes(&asserter, probe_value.clone());
+        push_bytes(&asserter, probe_value.clone());
+        push_bytes(&asserter, probe_value.clone());
+        push_bytes(&asserter, probe_value.clone());
+        push_bytes(&asserter, probe_value.clone());
+        push_bytes(&asserter, probe_value.clone());
+        push_bytes(&asserter, probe_value.clone());
+        push_bytes(&asserter, probe_value);
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(decision.pass);
+        assert_eq!(decision.score, 0);
+        assert!(decision.reasons.is_empty());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assess_rejects_when_max_tx_too_low() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "0".to_string(),
+            max_tax_bps: 100,
+            erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 200,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
+            sell_simulation_mode: "strict".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: None,
+            stable: None,
+            sellability_enabled: true,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"TestToken".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TST".to_string()),
+        );
+        asserter.push_failure_msg("probe revert");
+        push_bytes(
+            &asserter,
+            IERC20::totalSupplyCall::abi_encode_returns(&U256::from(1_000_000u64)),
+        );
+        for _ in 0..MAX_TX_SIGS.len() {
+            push_bytes(
+                &asserter,
+                U256::from(10_000u64).to_be_bytes::<32>().to_vec(),
+            );
+        }
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(!decision.pass);
+        assert!(decision.score >= SCORE_HIGH);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("max tx too low")));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assess_rejects_when_max_wallet_too_low() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "0".to_string(),
+            max_tax_bps: 100,
+            erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 300,
+            max_cooldown_secs: 0,
+            sell_simulation_mode: "strict".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: None,
+            stable: None,
+            sellability_enabled: true,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"TestToken".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TST".to_string()),
+        );
+        asserter.push_failure_msg("probe revert");
+        push_bytes(
+            &asserter,
+            IERC20::totalSupplyCall::abi_encode_returns(&U256::from(1_000_000u64)),
+        );
+        for _ in 0..MAX_WALLET_SIGS.len() {
+            push_bytes(
+                &asserter,
+                U256::from(15_000u64).to_be_bytes::<32>().to_vec(),
+            );
+        }
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(!decision.pass);
+        assert!(decision.score >= SCORE_HIGH);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("max wallet too low")));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assess_rejects_when_cooldown_too_long() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let cfg = RiskConfig {
+            sellability_amount_base: "0".to_string(),
+            max_tax_bps: 100,
+            erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 60,
+            sell_simulation_mode: "strict".to_string(),
+            sell_simulation_override_mode: "detect".to_string(),
+            token_override_slots: Vec::new(),
+        };
+        let engine = RiskEngine::new(cfg).unwrap();
+        let ctx = RiskContext {
+            provider: &provider,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            base_token: address!("0x2000000000000000000000000000000000000002"),
+            token: address!("0x3000000000000000000000000000000000000003"),
+            pair: None,
+            stable: None,
+            sellability_enabled: true,
+        };
+
+        asserter.push_success(&Bytes::from(vec![1u8]));
+        push_bytes(&asserter, IERC20::decimalsCall::abi_encode_returns(&18u8));
+        push_bytes(
+            &asserter,
+            IERC20::nameCall::abi_encode_returns(&"TestToken".to_string()),
+        );
+        push_bytes(
+            &asserter,
+            IERC20::symbolCall::abi_encode_returns(&"TST".to_string()),
+        );
+        asserter.push_failure_msg("probe revert");
+        push_bytes(&asserter, U256::from(120u64).to_be_bytes::<32>().to_vec());
+
+        let decision = engine.assess(&ctx).await.unwrap();
+        assert!(!decision.pass);
+        assert!(decision.score >= SCORE_HIGH);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("cooldown too long")));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
     async fn assess_passes_when_sellability_disabled() {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new()
@@ -956,6 +1913,11 @@ mod tests {
             sellability_amount_base: "0".to_string(),
             max_tax_bps: 100,
             erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
@@ -999,6 +1961,11 @@ mod tests {
             sellability_amount_base: "1000".to_string(),
             max_tax_bps: 100,
             erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
@@ -1054,6 +2021,11 @@ mod tests {
             sellability_amount_base: "1000".to_string(),
             max_tax_bps: 1000,
             erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
@@ -1125,6 +2097,11 @@ mod tests {
             sellability_amount_base: "1000".to_string(),
             max_tax_bps: 100,
             erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
@@ -1182,6 +2159,11 @@ mod tests {
             sellability_amount_base: "1000".to_string(),
             max_tax_bps: 100,
             erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
             sell_simulation_mode: "strict".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
@@ -1242,6 +2224,11 @@ mod tests {
             sellability_amount_base: "1000".to_string(),
             max_tax_bps: 100,
             erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
@@ -1308,6 +2295,11 @@ mod tests {
             sellability_amount_base: "1000".to_string(),
             max_tax_bps: 100,
             erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
@@ -1376,6 +2368,11 @@ mod tests {
             sellability_amount_base: "1000".to_string(),
             max_tax_bps: 100,
             erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "detect".to_string(),
             token_override_slots: Vec::new(),
@@ -1446,6 +2443,11 @@ mod tests {
             sellability_amount_base: "1000".to_string(),
             max_tax_bps: 100,
             erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "skip_any".to_string(),
             token_override_slots: Vec::new(),
@@ -1513,6 +2515,11 @@ mod tests {
             sellability_amount_base: "1000".to_string(),
             max_tax_bps: 100,
             erc20_call_timeout_ms: 500,
+            trading_control_check: false,
+            trading_control_fail_closed: false,
+            max_tx_min_supply_bps: 0,
+            max_wallet_min_supply_bps: 0,
+            max_cooldown_secs: 0,
             sell_simulation_mode: "best_effort".to_string(),
             sell_simulation_override_mode: "skip_any".to_string(),
             token_override_slots: Vec::new(),

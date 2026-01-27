@@ -2,6 +2,7 @@
 /target/
 /target-codex/
 /cache/
+/out/
 
 # Local config with RPC keys
 /config/sonic.alchemy.toml

@@ -117,8 +117,10 @@ impl CandidateStore {
             entry.update(candidate, BotState::Detecting, now_ms);
             return;
         }
-        self.entries
-            .put(hash, CandidateLifecycle::new(candidate, BotState::Detecting, now_ms));
+        self.entries.put(
+            hash,
+            CandidateLifecycle::new(candidate, BotState::Detecting, now_ms),
+        );
     }
 
     pub fn set_state(&mut self, candidate: LiquidityCandidate, state: BotState, now_ms: u64) {
@@ -233,9 +235,13 @@ pub struct Position {
     pub token: Address,
     pub base: Address,
     pub pricing_base: Address,
+    #[serde(default)]
+    pub token_decimals: Option<u8>,
     pub pair: Option<Address>,
     pub stable: Option<bool>,
     pub entry_base_amount: U256,
+    #[serde(default)]
+    pub entry_base_spent: Option<U256>,
     pub entry_token_amount: Option<U256>,
     pub entry_price_base_per_token: Option<U256>,
     #[serde(default)]
@@ -330,6 +336,25 @@ impl PositionStore {
         let snapshot = PositionStoreSnapshot {
             positions: self.entries.values().cloned().collect(),
         };
+        let mut data = serde_json::to_string_pretty(&snapshot)?;
+        data.push('\n');
+        let tmp_path = path.with_extension("tmp");
+        fs::write(&tmp_path, data)?;
+        fs::rename(tmp_path, path)?;
+        Ok(())
+    }
+
+    pub fn snapshot_positions(&self) -> Vec<Position> {
+        self.entries.values().cloned().collect()
+    }
+
+    pub fn persist_snapshot(path: &Path, positions: Vec<Position>) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let snapshot = PositionStoreSnapshot { positions };
         let mut data = serde_json::to_string_pretty(&snapshot)?;
         data.push('\n');
         let tmp_path = path.with_extension("tmp");
@@ -516,8 +541,7 @@ mod tests {
         let entry = store.entries.get(&hash).expect("entry");
         assert_eq!(entry.state, BotState::Executing);
 
-        let exec_hash =
-            b256!("0x0202020202020202020202020202020202020202020202020202020202020202");
+        let exec_hash = b256!("0x0202020202020202020202020202020202020202020202020202020202020202");
         store.mark_executed(hash, exec_hash, 1_300);
         let entry = store.entries.get(&hash).expect("entry");
         assert_eq!(entry.state, BotState::Managing);
@@ -577,16 +601,18 @@ mod tests {
     fn sample_position(hash: B256) -> Position {
         Position {
             add_liq_tx_hash: hash,
-            entry_tx_hash: b256!("0x5555555555555555555555555555555555555555555555555555555555555555"),
+            entry_tx_hash: b256!(
+                "0x5555555555555555555555555555555555555555555555555555555555555555"
+            ),
             router: address!("0x9999999999999999999999999999999999999999"),
             token: address!("0x6666666666666666666666666666666666666666"),
             base: address!("0x7777777777777777777777777777777777777777"),
             pricing_base: address!("0x7777777777777777777777777777777777777777"),
-            pair: Some(address!(
-                "0x8888888888888888888888888888888888888888"
-            )),
+            token_decimals: Some(18),
+            pair: Some(address!("0x8888888888888888888888888888888888888888")),
             stable: None,
             entry_base_amount: U256::from(1_000u64),
+            entry_base_spent: None,
             entry_token_amount: Some(U256::from(500u64)),
             entry_price_base_per_token: Some(U256::from(2_000u64)),
             entry_base_reserve: None,
@@ -660,12 +686,19 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         let mut path = std::env::temp_dir();
-        path.push(format!("sonic_positions_{}_{}.json", std::process::id(), nanos));
+        path.push(format!(
+            "sonic_positions_{}_{}.json",
+            std::process::id(),
+            nanos
+        ));
 
         store.persist_to(&path).expect("persist");
         let loaded = PositionStore::load_from(&path).expect("load");
         let loaded_position = loaded.get(hash).expect("position");
-        assert_eq!(loaded_position.entry_tx_hash, store.get(hash).unwrap().entry_tx_hash);
+        assert_eq!(
+            loaded_position.entry_tx_hash,
+            store.get(hash).unwrap().entry_tx_hash
+        );
 
         let _ = std::fs::remove_file(path);
     }

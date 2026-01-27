@@ -8,7 +8,10 @@ pub struct ReconnectConfig {
 
 impl ReconnectConfig {
     pub fn new(base_ms: u64, max_ms: u64) -> Self {
-        Self { base_delay: Duration::from_millis(base_ms), max_delay: Duration::from_millis(max_ms) }
+        Self {
+            base_delay: Duration::from_millis(base_ms),
+            max_delay: Duration::from_millis(max_ms),
+        }
     }
 }
 

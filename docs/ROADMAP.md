@@ -41,6 +41,16 @@ Developer roadmap with checklist items aligned to the original scope.
 - [x] Sellability simulation (base->token->base via eth_call)
 - [x] Tax estimation (expected vs simulated output)
 - [x] Risk score and reason propagation to decision logs
+- [x] Anti-scam: trading toggle/paused flags and trading window limits
+- [ ] Anti-scam: blacklist/whitelist gating (transfer/approval restrictions)
+- [x] Anti-scam: maxTx/maxWallet/cooldown enforcement detection
+- [ ] Anti-scam: sell-tax spikes vs buy-tax (dynamic fee profiling)
+- [ ] Anti-scam: transfer restrictions to pair/router (sell‑only reverts)
+- [ ] Anti-scam: privileged mint/burn or fee‑setters (owner backdoor)
+- [ ] Anti-scam: upgradeable proxy/backdoor detection (EIP-1967/Transparent/UUPS)
+- [ ] Anti-scam: rebase/elastic supply detection and accounting guardrails
+- [ ] Anti-scam: non‑standard ERC20 behavior (returns false, approve(0) requirement)
+- [ ] Anti-scam: LP lock/withdraw heuristics (owner‑removable liquidity)
 
 ## Phase 4: Execution Engine (V1)
 - [x] Executor tx builder for `buyV2`
@@ -49,15 +59,18 @@ Developer roadmap with checklist items aligned to the original scope.
 - [x] Sender stub for broadcast
 - [x] Solidly executor path (`buySolidly`)
 - [x] Nonce resync on startup + periodic refresh
+- [x] Nonce-safety: estimateGas without nonce + retry send on nonce-too-low
 - [x] Gas bump/replace policy with `bump_pct` + interval
 - [x] Confirm/receipt tracking with retry windows
 - [x] Enforce maxBlockNumber guard in live flow
+- [x] Nonce hardening: handle nonce gaps/too high, already known/underpriced, multi-process drift
 
 ## Phase 5: Strategy Orchestration (V1)
 - [x] Detect → qualify → execute loop wired
 - [x] Wait-for-mine logic on addLiquidity receipt (primary execution path)
 - [x] Optional same-block attempt strategy with guardrails
 - [x] Position tracking + basic exit loop (TP/SL/max hold)
+- [ ] Exit quoting: use block-pinned reserve snapshot + reserve guard + re-quote per block on retry
 - [x] Position persistence across restarts
 - [x] Router sellability recheck timer
 - [x] Emergency triggers (reserve drop, sell sim failure)
@@ -77,8 +90,8 @@ Developer roadmap with checklist items aligned to the original scope.
 - [x] Decide and document full-pipeline verification approach (anvil fork) with acceptance criteria
 - [ ] Integration tests with local sonic devnet
 - [ ] End-to-end pipeline smoke test harness on anvil/local chain (liquidity add → execution → exits → restart)
-- [ ] Token zoo risk harness on anvil (standard/FOT/honeypot/bad metadata/non-standard storage) + one-command runner
-- [ ] Telegram notifier for alerts and visibility (candidates, risk rejects, executions, PnL snapshots)
+- [ ] Token zoo risk harness on anvil (standard/FOT/honeypot/bad metadata/non-standard storage) + one-command runner; current limit-check zoo tokens (ZOK/ZST/ZCD) are documented in `docs/ops-runbook.md`.
+- [x] Telegram notifier for alerts and visibility (candidates, risk rejects, executions, PnL snapshots)
 - [ ] Optional Telegram control commands (restricted allowlist + audit log)
 
 ## Phase 8: Extensions (Post‑V1)

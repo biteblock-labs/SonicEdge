@@ -52,10 +52,21 @@ deadline_secs = 20
 sellability_amount_base = "1000000000000000"
 max_tax_bps = 1500
 erc20_call_timeout_ms = 120
+trading_control_check = true
+trading_control_fail_closed = false
+max_tx_min_supply_bps = 200
+max_wallet_min_supply_bps = 300
+max_cooldown_secs = 60
 sell_simulation_mode = "best_effort"
 sell_simulation_override_mode = "detect"
 token_override_slots = [
   { token = "0x29219dd400f2Bf60E5a23d13Be72B486D4038894", balance_slot = 9, allowance_slot = 10 },
+  { token = "0x4ed7c70F96B99c776995fB64377f0d4aB3B0e1C1", balance_slot = 4, allowance_slot = 5 },
+  { token = "0x84eA74d481Ee0A5332c457a4d796187F6Ba67fEB", balance_slot = 4, allowance_slot = 5 },
+  { token = "0xa85233C63b9Ee964Add6F2cffe00Fd84eb32338f", balance_slot = 4, allowance_slot = 5 },
+  { token = "0x4A679253410272dd5232B3Ff7cF5dbB88f295319", balance_slot = 9, allowance_slot = 10 },
+  { token = "0x46b142DD1E924FAb83eCc3c08e4D46E82f005e0E", balance_slot = 6, allowance_slot = 7 },
+  { token = "0xC9a43158891282A2B1475592D5719c001986Aaec", balance_slot = 6, allowance_slot = 7 },
 ]
 
 [executor]
@@ -63,11 +74,14 @@ owner_private_key_env = "SNIPER_PK"
 executor_contract = "0xb7f8bc63bbcad18155201308c8f3540b07f84f5e"
 gas_mode = "eip1559"
 auto_approve_mode = "exact"
+gas_limit_buffer_bps = 2000
 max_fee_gwei = 200
 max_priority_gwei = 50
 bump_pct = 15
 bump_interval_ms = 800
 nonce_sync_interval_ms = 10000
+nonce_retry_delay_ms = 200
+nonce_retry_max_retries = 1
 receipt_poll_interval_ms = 2000
 receipt_timeout_ms = 120000
 max_block_number_delta = 1
@@ -79,6 +93,15 @@ max_hold_secs = 900
 exit_signal_ttl_secs = 3600
 emergency_reserve_drop_bps = 0
 emergency_sell_sim_failures = 0
+buy_amount_mode = "fixed"
+buy_amount_fixed = "1000000000000000000"
+buy_amount_wallet_bps = 0
+buy_amount_min = "0"
+buy_amount_max = "0"
+buy_amount_max_liquidity_bps = 0
+buy_amount_unavailable_retry_ttl_ms = 300000
+buy_amount_native_reserve = "50000000000000000"
+position_log_interval_ms = 5000
 position_store_path = "state/positions.json"
 wait_for_mine = true
 same_block_attempt = false
@@ -93,3 +116,5 @@ metrics_enabled = true
 metrics_bind = "0.0.0.0:9102"
 log_level = "info"
 log_format = "pretty"
+base_usd_price = 1.00
+base_decimals = 18

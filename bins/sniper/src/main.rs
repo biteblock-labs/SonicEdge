@@ -10,7 +10,7 @@ use sonic_dex::decode_router_calldata;
 use std::path::PathBuf;
 use std::str::FromStr;
 use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, prelude::*};
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 #[derive(Parser)]
 #[command(name = "sniper", version, about = "SonicEdge mempool sniper")]

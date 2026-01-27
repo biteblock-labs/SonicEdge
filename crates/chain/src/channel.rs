@@ -22,8 +22,16 @@ pub fn tracked_channel<T>(
 ) -> (TrackedSender<T>, TrackedReceiver<T>) {
     let (sender, receiver) = mpsc::channel(capacity);
     let len = Arc::new(AtomicUsize::new(0));
-    let sender = TrackedSender { sender, len: len.clone(), metrics: metrics.clone() };
-    let receiver = TrackedReceiver { receiver, len, metrics };
+    let sender = TrackedSender {
+        sender,
+        len: len.clone(),
+        metrics: metrics.clone(),
+    };
+    let receiver = TrackedReceiver {
+        receiver,
+        len,
+        metrics,
+    };
     (sender, receiver)
 }
 
@@ -53,9 +61,11 @@ impl<T> TrackedReceiver<T> {
     pub async fn recv(&mut self) -> Option<T> {
         let item = self.receiver.recv().await;
         if item.is_some() {
-            let _ = self.len.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-                value.checked_sub(1)
-            });
+            let _ = self
+                .len
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                    value.checked_sub(1)
+                });
         }
         let len = self.len.load(Ordering::SeqCst);
         if let Some(metrics) = &self.metrics {

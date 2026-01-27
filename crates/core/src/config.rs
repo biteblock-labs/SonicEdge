@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::error::Result;
+use crate::modes::{
+    AutoApproveMode, BuyAmountMode, LaunchGateMode, SellSimulationMode, SellSimulationOverrideMode,
+};
 use crate::utils::{parse_address, parse_b256, parse_u256_decimal};
 
 macro_rules! bail_config {
@@ -83,6 +86,16 @@ pub struct RiskConfig {
     pub sellability_amount_base: String,
     pub max_tax_bps: u32,
     pub erc20_call_timeout_ms: u64,
+    #[serde(default)]
+    pub trading_control_check: bool,
+    #[serde(default)]
+    pub trading_control_fail_closed: bool,
+    #[serde(default)]
+    pub max_tx_min_supply_bps: u32,
+    #[serde(default)]
+    pub max_wallet_min_supply_bps: u32,
+    #[serde(default)]
+    pub max_cooldown_secs: u64,
     #[serde(default = "default_sell_simulation_mode")]
     pub sell_simulation_mode: String,
     #[serde(default = "default_sell_simulation_override_mode")]
@@ -105,12 +118,18 @@ pub struct ExecutorConfig {
     pub gas_mode: String,
     #[serde(default = "default_auto_approve_mode")]
     pub auto_approve_mode: String,
+    #[serde(default = "default_gas_limit_buffer_bps")]
+    pub gas_limit_buffer_bps: u32,
     pub max_fee_gwei: u64,
     pub max_priority_gwei: u64,
     pub bump_pct: u32,
     pub bump_interval_ms: u64,
     #[serde(default = "default_nonce_sync_interval_ms")]
     pub nonce_sync_interval_ms: u64,
+    #[serde(default = "default_nonce_retry_delay_ms")]
+    pub nonce_retry_delay_ms: u64,
+    #[serde(default = "default_nonce_retry_max_retries")]
+    pub nonce_retry_max_retries: u8,
     #[serde(default = "default_receipt_poll_interval_ms")]
     pub receipt_poll_interval_ms: u64,
     #[serde(default = "default_receipt_timeout_ms")]
@@ -130,6 +149,24 @@ pub struct StrategyConfig {
     pub emergency_reserve_drop_bps: u32,
     #[serde(default = "default_emergency_sell_sim_failures")]
     pub emergency_sell_sim_failures: u8,
+    #[serde(default = "default_buy_amount_mode")]
+    pub buy_amount_mode: String,
+    #[serde(default = "default_buy_amount_fixed")]
+    pub buy_amount_fixed: String,
+    #[serde(default = "default_buy_amount_wallet_bps")]
+    pub buy_amount_wallet_bps: u32,
+    #[serde(default = "default_buy_amount_min")]
+    pub buy_amount_min: String,
+    #[serde(default = "default_buy_amount_max")]
+    pub buy_amount_max: String,
+    #[serde(default = "default_buy_amount_max_liquidity_bps")]
+    pub buy_amount_max_liquidity_bps: u32,
+    #[serde(default = "default_buy_amount_unavailable_retry_ttl_ms")]
+    pub buy_amount_unavailable_retry_ttl_ms: u64,
+    #[serde(default = "default_buy_amount_native_reserve")]
+    pub buy_amount_native_reserve: String,
+    #[serde(default = "default_position_log_interval_ms")]
+    pub position_log_interval_ms: u64,
     #[serde(default)]
     pub position_store_path: Option<String>,
     #[serde(default = "default_wait_for_mine")]
@@ -156,6 +193,10 @@ pub struct ObservabilityConfig {
     pub log_level: String,
     #[serde(default = "default_log_format")]
     pub log_format: String,
+    #[serde(default)]
+    pub base_usd_price: Option<f64>,
+    #[serde(default = "default_base_decimals")]
+    pub base_decimals: u8,
 }
 
 impl AppConfig {
@@ -193,14 +234,10 @@ impl AppConfig {
             let router = parse_address(entry.router.trim())?;
             let factory = parse_address(entry.factory.trim())?;
             if !routers.contains(&router) {
-                bail_config!(
-                    "dex.router_factories router {router:?} missing from dex.routers"
-                );
+                bail_config!("dex.router_factories router {router:?} missing from dex.routers");
             }
             if !factories.contains(&factory) {
-                bail_config!(
-                    "dex.router_factories factory {factory:?} missing from dex.factories"
-                );
+                bail_config!("dex.router_factories factory {factory:?} missing from dex.factories");
             }
         }
 
@@ -217,9 +254,18 @@ impl AppConfig {
         let _ = parse_u256_decimal(self.dex.min_base_amount.trim())?;
         ensure_max_bps("dex.max_slippage_bps", self.dex.max_slippage_bps)?;
         ensure_non_zero_u64("dex.deadline_secs", self.dex.deadline_secs)?;
+        ensure_valid_launch_gate_mode(&self.dex.launch_only_liquidity_gate_mode)?;
 
         let _ = parse_u256_decimal(self.risk.sellability_amount_base.trim())?;
         ensure_max_bps("risk.max_tax_bps", self.risk.max_tax_bps)?;
+        ensure_max_bps(
+            "risk.max_tx_min_supply_bps",
+            self.risk.max_tx_min_supply_bps,
+        )?;
+        ensure_max_bps(
+            "risk.max_wallet_min_supply_bps",
+            self.risk.max_wallet_min_supply_bps,
+        )?;
         ensure_valid_sell_simulation_mode(&self.risk.sell_simulation_mode)?;
         ensure_valid_sell_simulation_override_mode(&self.risk.sell_simulation_override_mode)?;
         let mut override_tokens = HashSet::new();
@@ -230,16 +276,21 @@ impl AppConfig {
                 bail_config!("risk.token_override_slots token must not be zero");
             }
             if !override_tokens.insert(token) {
-                bail_config!(
-                    "risk.token_override_slots token {token:?} appears more than once"
-                );
+                bail_config!("risk.token_override_slots token {token:?} appears more than once");
             }
         }
 
-        ensure_non_empty("executor.owner_private_key_env", &self.executor.owner_private_key_env)?;
+        ensure_non_empty(
+            "executor.owner_private_key_env",
+            &self.executor.owner_private_key_env,
+        )?;
         let _ = parse_address(self.executor.executor_contract.trim())?;
         ensure_valid_gas_mode(&self.executor.gas_mode)?;
         ensure_valid_auto_approve_mode(&self.executor.auto_approve_mode)?;
+        ensure_max_bps(
+            "executor.gas_limit_buffer_bps",
+            self.executor.gas_limit_buffer_bps,
+        )?;
 
         ensure_max_bps("strategy.take_profit_bps", self.strategy.take_profit_bps)?;
         ensure_max_bps("strategy.stop_loss_bps", self.strategy.stop_loss_bps)?;
@@ -247,18 +298,66 @@ impl AppConfig {
             "strategy.emergency_reserve_drop_bps",
             self.strategy.emergency_reserve_drop_bps,
         )?;
+        let buy_amount_fixed = parse_u256_decimal(self.strategy.buy_amount_fixed.trim())?;
+        let buy_amount_min = parse_u256_decimal(self.strategy.buy_amount_min.trim())?;
+        let buy_amount_max = parse_u256_decimal(self.strategy.buy_amount_max.trim())?;
+        let _buy_amount_native_reserve =
+            parse_u256_decimal(self.strategy.buy_amount_native_reserve.trim())?;
+        ensure_max_bps(
+            "strategy.buy_amount_wallet_bps",
+            self.strategy.buy_amount_wallet_bps,
+        )?;
+        ensure_max_bps(
+            "strategy.buy_amount_max_liquidity_bps",
+            self.strategy.buy_amount_max_liquidity_bps,
+        )?;
+        if !buy_amount_min.is_zero() && !buy_amount_max.is_zero() && buy_amount_min > buy_amount_max
+        {
+            bail_config!("strategy.buy_amount_min must be <= strategy.buy_amount_max");
+        }
+        match BuyAmountMode::parse(&self.strategy.buy_amount_mode)? {
+            BuyAmountMode::Liquidity => {}
+            BuyAmountMode::Fixed => {
+                if buy_amount_fixed.is_zero() {
+                    bail_config!(
+                        "strategy.buy_amount_fixed must be > 0 when strategy.buy_amount_mode=fixed"
+                    );
+                }
+            }
+            BuyAmountMode::WalletPct => {
+                if self.strategy.buy_amount_wallet_bps == 0 {
+                    bail_config!(
+                        "strategy.buy_amount_wallet_bps must be > 0 when strategy.buy_amount_mode=wallet_pct"
+                    );
+                }
+            }
+        }
         if let Some(path) = self.strategy.position_store_path.as_deref() {
             ensure_non_empty("strategy.position_store_path", path)?;
         }
 
         if self.observability.metrics_enabled {
-            ensure_non_empty("observability.metrics_bind", &self.observability.metrics_bind)?;
+            ensure_non_empty(
+                "observability.metrics_bind",
+                &self.observability.metrics_bind,
+            )?;
         }
         ensure_non_empty("observability.log_level", &self.observability.log_level)?;
         ensure_valid_log_format(&self.observability.log_format)?;
+        if let Some(price) = self.observability.base_usd_price {
+            if price.is_sign_negative() {
+                bail_config!("observability.base_usd_price must be >= 0");
+            }
+        }
+        if self.observability.base_decimals == 0 || self.observability.base_decimals > 36 {
+            bail_config!("observability.base_decimals must be between 1 and 36");
+        }
 
         ensure_non_zero_usize("mempool.fetch_concurrency", self.mempool.fetch_concurrency)?;
-        ensure_non_zero_u64("mempool.tx_fetch_timeout_ms", self.mempool.tx_fetch_timeout_ms)?;
+        ensure_non_zero_u64(
+            "mempool.tx_fetch_timeout_ms",
+            self.mempool.tx_fetch_timeout_ms,
+        )?;
         if self.mempool.mode.contains("txpool") {
             ensure_non_zero_u64("mempool.txpool_poll_ms", self.mempool.txpool_poll_ms)?;
         }
@@ -277,8 +376,7 @@ impl AppConfig {
                     warnings.push(format!(
                         "private key env var {env_key} is empty; executions will be skipped"
                     ));
-                } else if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit())
-                {
+                } else if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
                     warnings.push(format!(
                         "private key env var {env_key} is not a 32-byte hex string; executions will be skipped"
                     ));
@@ -290,9 +388,8 @@ impl AppConfig {
         }
         let contract = parse_address(self.executor.executor_contract.trim())?;
         if contract == Address::ZERO {
-            warnings.push(
-                "executor.executor_contract is zero; executions will be skipped".to_string(),
-            );
+            warnings
+                .push("executor.executor_contract is zero; executions will be skipped".to_string());
         }
         Ok(warnings)
     }
@@ -351,27 +448,23 @@ fn ensure_valid_gas_mode(value: &str) -> Result<()> {
 }
 
 fn ensure_valid_auto_approve_mode(value: &str) -> Result<()> {
-    let normalized = value.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "off" | "exact" | "max" => Ok(()),
-        _ => bail_config!("unsupported executor.auto_approve_mode: {value}"),
-    }
+    AutoApproveMode::parse(value)?;
+    Ok(())
 }
 
 fn ensure_valid_sell_simulation_mode(value: &str) -> Result<()> {
-    let normalized = value.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "strict" | "best_effort" | "best-effort" | "besteffort" => Ok(()),
-        _ => bail_config!("unsupported risk.sell_simulation_mode: {value}"),
-    }
+    SellSimulationMode::parse(value)?;
+    Ok(())
 }
 
 fn ensure_valid_sell_simulation_override_mode(value: &str) -> Result<()> {
-    let normalized = value.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "detect" | "skip_any" | "skip-any" | "skipany" => Ok(()),
-        _ => bail_config!("unsupported risk.sell_simulation_override_mode: {value}"),
-    }
+    SellSimulationOverrideMode::parse(value)?;
+    Ok(())
+}
+
+fn ensure_valid_launch_gate_mode(value: &str) -> Result<()> {
+    LaunchGateMode::parse(value)?;
+    Ok(())
 }
 
 fn ensure_valid_log_format(value: &str) -> Result<()> {
@@ -388,6 +481,10 @@ fn default_pair_cache_capacity() -> usize {
 
 fn default_auto_approve_mode() -> String {
     "off".to_string()
+}
+
+fn default_gas_limit_buffer_bps() -> u32 {
+    2000
 }
 
 fn default_sell_simulation_mode() -> String {
@@ -412,6 +509,10 @@ fn default_pair_cache_negative_ttl_ms() -> u64 {
 
 fn default_sellability_recheck_interval_ms() -> u64 {
     0
+}
+
+fn default_base_decimals() -> u8 {
+    18
 }
 
 fn default_dedup_capacity() -> usize {
@@ -444,6 +545,42 @@ fn default_candidate_cache_capacity() -> usize {
 
 fn default_candidate_ttl_ms() -> u64 {
     300_000
+}
+
+fn default_buy_amount_mode() -> String {
+    "liquidity".to_string()
+}
+
+fn default_buy_amount_fixed() -> String {
+    "0".to_string()
+}
+
+fn default_buy_amount_wallet_bps() -> u32 {
+    0
+}
+
+fn default_buy_amount_min() -> String {
+    "0".to_string()
+}
+
+fn default_buy_amount_max() -> String {
+    "0".to_string()
+}
+
+fn default_buy_amount_max_liquidity_bps() -> u32 {
+    0
+}
+
+fn default_buy_amount_unavailable_retry_ttl_ms() -> u64 {
+    0
+}
+
+fn default_buy_amount_native_reserve() -> String {
+    "0".to_string()
+}
+
+fn default_position_log_interval_ms() -> u64 {
+    30_000
 }
 
 fn default_wait_for_mine() -> bool {
@@ -480,6 +617,14 @@ fn default_wait_for_mine_timeout_ms() -> u64 {
 
 fn default_nonce_sync_interval_ms() -> u64 {
     10_000
+}
+
+fn default_nonce_retry_delay_ms() -> u64 {
+    200
+}
+
+fn default_nonce_retry_max_retries() -> u8 {
+    1
 }
 
 fn default_receipt_poll_interval_ms() -> u64 {

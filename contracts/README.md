@@ -33,3 +33,11 @@ solc --optimize --optimize-runs 200 --bin --bin-runtime --abi SonicSniperExecuto
 - The contract is **not** upgradeable.
 - Keep the owner key offline except for bot operations.
 - Any ABI change (like adding `buySolidly`) requires redeploying the executor and updating `contracts/abi/`.
+
+## Test Tokens (Anvil)
+
+- `ZooLimitToken.sol` is used to exercise maxTx/maxWallet/cooldown checks.
+- Current zoo limit tokens (addresses reset when Anvil restarts):
+  - ZOK `0xfbC22278A96299D91d41C453234d97b4F5Eb9B2d` (pass)
+  - ZST `0x46b142DD1E924FAb83eCc3c08e4D46E82f005e0E` (fail maxTx/maxWallet)
+  - ZCD `0xC9a43158891282A2B1475592D5719c001986Aaec` (fail cooldown)

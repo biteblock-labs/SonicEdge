@@ -43,10 +43,7 @@ impl BotMetrics {
         ))?;
         registry.register(Box::new(executions_total.clone()))?;
         let failures_total = IntCounterVec::new(
-            Opts::new(
-                "sonic_failures_total",
-                "Total candidate failures by kind",
-            ),
+            Opts::new("sonic_failures_total", "Total candidate failures by kind"),
             &["kind"],
         )?;
         registry.register(Box::new(failures_total.clone()))?;

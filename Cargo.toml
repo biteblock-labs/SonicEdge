@@ -32,3 +32,4 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"]
 dotenvy = "0.15"
 
 prometheus = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

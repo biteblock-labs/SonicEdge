@@ -19,3 +19,5 @@ sonic-executor = { path = "../executor" }
 sonic-risk = { path = "../risk" }
 tokio.workspace = true
 tracing.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true

@@ -5,13 +5,6 @@ pub mod sender;
 pub mod tx_builder;
 
 pub use tx_builder::{
-    BuySolidlyEthParams,
-    BuySolidlyParams,
-    BuyV2EthParams,
-    BuyV2Params,
-    ExecutorTxBuilder,
-    SellSolidlyEthParams,
-    SellSolidlyParams,
-    SellV2EthParams,
-    SellV2Params,
+    BuySolidlyEthParams, BuySolidlyParams, BuyV2EthParams, BuyV2Params, ExecutorTxBuilder,
+    SellSolidlyEthParams, SellSolidlyParams, SellV2EthParams, SellV2Params,
 };

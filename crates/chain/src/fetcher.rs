@@ -8,6 +8,7 @@ use sonic_core::utils::now_ms;
 use std::time::Duration;
 use tracing::warn;
 
+#[derive(Clone)]
 pub struct TxFetcher {
     provider: DynProvider,
     timeout: Duration,

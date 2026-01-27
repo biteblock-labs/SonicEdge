@@ -29,6 +29,16 @@ impl NonceManager {
         self.set(next);
         Ok(next)
     }
+
+    pub async fn sync_allow_decrease(
+        &self,
+        provider: &DynProvider,
+        address: Address,
+    ) -> Result<u64> {
+        let pending = provider.get_transaction_count(address).pending().await?;
+        self.set(pending);
+        Ok(pending)
+    }
 }
 
 #[cfg(test)]
@@ -48,7 +58,10 @@ mod tests {
 
         let manager = NonceManager::new(0);
         let nonce = manager
-            .sync(&provider, address!("0x1000000000000000000000000000000000000001"))
+            .sync(
+                &provider,
+                address!("0x1000000000000000000000000000000000000001"),
+            )
             .await
             .unwrap();
 
@@ -69,12 +82,38 @@ mod tests {
         let manager = NonceManager::new(0);
         manager.set(9);
         let nonce = manager
-            .sync(&provider, address!("0x1000000000000000000000000000000000000001"))
+            .sync(
+                &provider,
+                address!("0x1000000000000000000000000000000000000001"),
+            )
             .await
             .unwrap();
 
         assert_eq!(nonce, 9);
         assert_eq!(manager.next_nonce(), 9);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_allow_decrease_can_lower_nonce() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        asserter.push_success(&3u64);
+
+        let manager = NonceManager::new(0);
+        manager.set(7);
+        let nonce = manager
+            .sync_allow_decrease(
+                &provider,
+                address!("0x1000000000000000000000000000000000000001"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(nonce, 3);
+        assert_eq!(manager.next_nonce(), 3);
         assert!(asserter.read_q().is_empty());
     }
 }

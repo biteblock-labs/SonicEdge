@@ -1,70 +1,62 @@
 use crate::abi::IERC20;
 use crate::metrics::{spawn_metrics_server, BotMetrics};
+use crate::notifier::TelegramNotifier;
 use crate::state::{
-    BotState,
-    CandidateStore,
-    DropKind,
-    ExitReason,
-    Position,
-    PositionStatus,
-    PositionStore,
+    BotState, CandidateStore, DropKind, ExitReason, Position, PositionStatus, PositionStore,
 };
 use alloy::eips::BlockId;
-use alloy::primitives::{address, keccak256, Address, B256, TxKind, U256};
+use alloy::network::TransactionResponse;
+use alloy::primitives::{address, keccak256, Address, TxKind, B256, U256};
+use alloy::providers::ext::TxPoolApi;
+use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::state::{AccountOverride, StateOverride, StateOverridesBuilder};
 use alloy::rpc::types::transaction::TransactionInput;
 use alloy::rpc::types::TransactionRequest;
-use alloy::providers::{DynProvider, Provider};
 use alloy::sol_types::SolCall;
-use anyhow::{bail, Result};
+use anyhow::Result;
+use futures_util::stream::FuturesUnordered;
+use futures_util::StreamExt;
 use sonic_chain::{
-    NewHeadStream,
-    NodeClient,
-    PendingTxStream,
-    ReconnectConfig,
-    TxFetcher,
-    TxpoolBackfill,
+    NewHeadStream, NodeClient, PendingTxStream, ReconnectConfig, TxFetcher, TxpoolBackfill,
 };
 use sonic_core::config::AppConfig;
 use sonic_core::dedupe::DedupeCache;
+use sonic_core::modes::{AutoApproveMode, BuyAmountMode, LaunchGateMode};
 use sonic_core::types::{LiquidityCandidate, MempoolTx};
 use sonic_core::utils::{now_ms, parse_address, parse_b256, parse_u256_decimal};
-use sonic_dex::abi::{IUniswapV2Router02, ISolidlyRouter, Route};
+use sonic_dex::abi::{ISolidlyRouter, IUniswapV2Router02, Route};
 use sonic_dex::pair::{
-    contract_exists_at_block,
-    get_pair_tokens,
-    get_reserves,
-    get_reserves_at_block,
-    get_pair_address,
-    get_pair_address_solidly,
+    contract_exists_at_block, get_pair_address, get_pair_address_solidly, get_pair_tokens,
+    get_reserves, get_reserves_at_block,
 };
 use sonic_dex::{decode_router_calldata, PairMetadataCache, RouterCall};
 use sonic_executor::fees::{FeeStrategy, GasMode};
 use sonic_executor::{nonce::NonceManager, sender::TxSender};
 use sonic_executor::{
-    BuySolidlyEthParams,
-    BuySolidlyParams,
-    BuyV2EthParams,
-    BuyV2Params,
-    ExecutorTxBuilder,
-    SellSolidlyEthParams,
-    SellSolidlyParams,
-    SellV2EthParams,
-    SellV2Params,
+    BuySolidlyEthParams, BuySolidlyParams, BuyV2EthParams, BuyV2Params, ExecutorTxBuilder,
+    SellSolidlyEthParams, SellSolidlyParams, SellV2EthParams, SellV2Params,
 };
 use sonic_risk::{RiskContext, RiskEngine};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::select;
-use tokio::time::Duration;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 const SUMMARY_INTERVAL_MS: u64 = 30_000;
 const HEAD_FRESHNESS_MS: u64 = 10_000;
 const MAX_EXECUTION_ATTEMPTS: u8 = 2;
 const EXIT_POLL_INTERVAL_MS: u64 = 1_000;
+const PRUNE_INTERVAL_MS: u64 = 1_000;
+const POSITION_FLUSH_INTERVAL_MS: u64 = 1_000;
+const FETCH_QUEUE_MULTIPLIER: usize = 4;
+const FETCH_DRAIN_INTERVAL_MS: u64 = 25;
+const SONICSCAN_TX_BASE: &str = "https://sonicscan.org/tx/";
 const BPS_DENOMINATOR: u64 = 10_000;
 const PRICE_SCALE: u128 = 1_000_000_000_000_000_000u128;
 const ERC20_BALANCES_SLOT: u64 = 0;
@@ -87,53 +79,41 @@ impl TokenOverrideSlots {
 }
 
 enum ExecutionOutcome {
-    Sent { hash: B256, tx: TransactionRequest },
+    Sent {
+        hash: B256,
+        tx: TransactionRequest,
+        entry_base_amount: U256,
+    },
     Skipped(&'static str, DropKind),
+}
+
+const BUY_AMOUNT_UNAVAILABLE_REASON: &str = "buy amount unavailable";
+
+enum DeferredReason {
+    Transient,
+    BuyAmountUnavailable,
+}
+
+enum ExecutionAttemptOutcome {
+    Executed,
+    Deferred(DeferredReason),
+    Skipped,
 }
 
 enum LaunchGateDecision {
     Allow,
-    Reject {
-        reason: String,
-        kind: DropKind,
-    },
+    Reject { reason: String, kind: DropKind },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LaunchGateMode {
-    Strict,
-    BestEffort,
+#[derive(Debug)]
+enum BuyAmountError {
+    InsufficientFunds(&'static str),
+    BalanceUnavailable(String),
+    Invalid(&'static str),
 }
 
-impl LaunchGateMode {
-    fn parse(raw: &str) -> Result<Self> {
-        let normalized = raw.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "strict" => Ok(Self::Strict),
-            "best_effort" | "best-effort" | "besteffort" => Ok(Self::BestEffort),
-            _ => bail!("unsupported launch_only_liquidity_gate_mode: {raw}"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AutoApproveMode {
-    Off,
-    Exact,
-    Max,
-}
-
-impl AutoApproveMode {
-    fn parse(raw: &str) -> Result<Self> {
-        let normalized = raw.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "off" => Ok(Self::Off),
-            "exact" => Ok(Self::Exact),
-            "max" => Ok(Self::Max),
-            _ => bail!("unsupported executor.auto_approve_mode: {raw}"),
-        }
-    }
-}
+type BuyAmountResult<T> = std::result::Result<T, BuyAmountError>;
+type FetchFuture = std::pin::Pin<Box<dyn std::future::Future<Output = FetchedTx> + Send>>;
 
 pub struct Bot {
     cfg: AppConfig,
@@ -149,12 +129,24 @@ pub struct Bot {
     pair_cache: PairMetadataCache,
     dedupe: DedupeCache<B256>,
     metrics: Option<Arc<BotMetrics>>,
+    notifier: Option<TelegramNotifier>,
     tx_builder: ExecutorTxBuilder,
     nonce: NonceManager,
     sender: TxSender,
     min_base_amount: U256,
+    buy_amount_mode: BuyAmountMode,
+    buy_amount_fixed: U256,
+    buy_amount_wallet_bps: u32,
+    buy_amount_min: U256,
+    buy_amount_max: U256,
+    buy_amount_max_liquidity_bps: u32,
+    buy_amount_native_reserve: U256,
+    position_log_interval_ms: u64,
+    position_log_last_ms: HashMap<B256, u64>,
+    position_snapshot_last_dir: HashMap<B256, bool>,
     launch_gate_mode: LaunchGateMode,
     auto_approve_mode: AutoApproveMode,
+    gas_limit_buffer_bps: u32,
     pending_liquidity: HashMap<B256, PendingLiquidity>,
     pending_receipts: HashMap<B256, PendingReceipt>,
     pending_exits: HashMap<B256, PendingExit>,
@@ -165,13 +157,20 @@ pub struct Bot {
     candidate_store: CandidateStore,
     positions: PositionStore,
     position_store_path: Option<PathBuf>,
+    positions_dirty: bool,
+    positions_flush_tx: Option<mpsc::Sender<()>>,
     token_override_slots: HashMap<Address, TokenOverrideSlots>,
+    base_usd_price: Option<f64>,
+    base_decimals: u8,
+    total_realized_pnl_base: HashMap<Address, f64>,
+    token_decimals_cache: HashMap<Address, u8>,
 }
 
 #[derive(Default, Clone, Copy)]
 struct Counters {
     hashes_seen: u64,
     dedupe_dropped: u64,
+    fetch_dropped: u64,
     tx_missing: u64,
     tx_fetched: u64,
     router_hits: u64,
@@ -191,15 +190,22 @@ impl Counters {
         Counters {
             hashes_seen: self.hashes_seen.saturating_sub(previous.hashes_seen),
             dedupe_dropped: self.dedupe_dropped.saturating_sub(previous.dedupe_dropped),
+            fetch_dropped: self.fetch_dropped.saturating_sub(previous.fetch_dropped),
             tx_missing: self.tx_missing.saturating_sub(previous.tx_missing),
             tx_fetched: self.tx_fetched.saturating_sub(previous.tx_fetched),
             router_hits: self.router_hits.saturating_sub(previous.router_hits),
             decoded: self.decoded.saturating_sub(previous.decoded),
             candidates: self.candidates.saturating_sub(previous.candidates),
-            filtered_base_token: self.filtered_base_token.saturating_sub(previous.filtered_base_token),
-            filtered_min_amount: self.filtered_min_amount.saturating_sub(previous.filtered_min_amount),
+            filtered_base_token: self
+                .filtered_base_token
+                .saturating_sub(previous.filtered_base_token),
+            filtered_min_amount: self
+                .filtered_min_amount
+                .saturating_sub(previous.filtered_min_amount),
             pair_resolved: self.pair_resolved.saturating_sub(previous.pair_resolved),
-            pair_unresolved: self.pair_unresolved.saturating_sub(previous.pair_unresolved),
+            pair_unresolved: self
+                .pair_unresolved
+                .saturating_sub(previous.pair_unresolved),
             risk_pass: self.risk_pass.saturating_sub(previous.risk_pass),
             risk_fail: self.risk_fail.saturating_sub(previous.risk_fail),
             executed: self.executed.saturating_sub(previous.executed),
@@ -216,8 +222,10 @@ struct CounterSummary {
 #[derive(Clone, Debug)]
 struct PendingReceipt {
     candidate_hash: B256,
+    candidate: LiquidityCandidate,
     sent_at_ms: u64,
     last_sent_ms: u64,
+    entry_base_amount: U256,
     tx: TransactionRequest,
 }
 
@@ -227,12 +235,33 @@ struct PendingExit {
     sent_at_ms: u64,
     last_sent_ms: u64,
     tx: Option<TransactionRequest>,
+    entry_base_amount: U256,
+    min_amount_out: U256,
+    pnl_base_est: Option<U256>,
+    pnl_bps_est: Option<U256>,
+    pnl_dir_up: Option<bool>,
+}
+
+struct ExitPnl {
+    out: U256,
+    pnl: U256,
+    pnl_bps: Option<U256>,
+    up: bool,
+    exact: bool,
+    net_pnl: Option<U256>,
+    net_up: Option<bool>,
+    net_bps: Option<U256>,
 }
 
 #[derive(Clone, Debug)]
 struct PendingLiquidity {
     candidate: LiquidityCandidate,
     enqueued_ms: u64,
+    buy_amount_unavailable_since_ms: Option<u64>,
+}
+
+struct FetchedTx {
+    tx: Option<MempoolTx>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,6 +306,7 @@ impl CounterSummary {
         info!(
             hashes = delta.hashes_seen,
             dedupe_dropped = delta.dedupe_dropped,
+            fetch_dropped = delta.fetch_dropped,
             tx_missing = delta.tx_missing,
             tx_fetched = delta.tx_fetched,
             router_hits = delta.router_hits,
@@ -368,10 +398,18 @@ impl Bot {
         let nonce = NonceManager::new(0);
         let sender = TxSender::new(chain.http.clone());
         let min_base_amount = parse_u256_decimal(&cfg.dex.min_base_amount)?;
-        let launch_gate_mode =
-            LaunchGateMode::parse(&cfg.dex.launch_only_liquidity_gate_mode)?;
-        let auto_approve_mode =
-            AutoApproveMode::parse(&cfg.executor.auto_approve_mode)?;
+        let buy_amount_mode = BuyAmountMode::parse(&cfg.strategy.buy_amount_mode)?;
+        let buy_amount_fixed = parse_u256_decimal(&cfg.strategy.buy_amount_fixed)?;
+        let buy_amount_min = parse_u256_decimal(&cfg.strategy.buy_amount_min)?;
+        let buy_amount_max = parse_u256_decimal(&cfg.strategy.buy_amount_max)?;
+        let buy_amount_wallet_bps = cfg.strategy.buy_amount_wallet_bps;
+        let buy_amount_max_liquidity_bps = cfg.strategy.buy_amount_max_liquidity_bps;
+        let buy_amount_native_reserve =
+            parse_u256_decimal(&cfg.strategy.buy_amount_native_reserve)?;
+        let position_log_interval_ms = cfg.strategy.position_log_interval_ms;
+        let launch_gate_mode = LaunchGateMode::parse(&cfg.dex.launch_only_liquidity_gate_mode)?;
+        let auto_approve_mode = AutoApproveMode::parse(&cfg.executor.auto_approve_mode)?;
+        let gas_limit_buffer_bps = cfg.executor.gas_limit_buffer_bps;
         let mut token_override_slots = HashMap::new();
         for entry in &cfg.risk.token_override_slots {
             let token = parse_address(entry.token.trim())?;
@@ -409,6 +447,12 @@ impl Bot {
         } else {
             None
         };
+        let base_usd_price = cfg.observability.base_usd_price;
+        let base_decimals = cfg.observability.base_decimals;
+        let notifier = TelegramNotifier::from_env();
+        if notifier.is_some() {
+            info!("telegram notifier enabled");
+        }
         Self::report_router_meta(&router_meta, metrics.as_ref().map(Arc::as_ref));
         let counters = CounterSummary::new(now_ms());
         let candidate_store = CandidateStore::new(
@@ -485,12 +529,24 @@ impl Bot {
             pair_cache,
             dedupe,
             metrics,
+            notifier,
             tx_builder,
             nonce,
             sender,
             min_base_amount,
+            buy_amount_mode,
+            buy_amount_fixed,
+            buy_amount_wallet_bps,
+            buy_amount_min,
+            buy_amount_max,
+            buy_amount_max_liquidity_bps,
+            buy_amount_native_reserve,
+            position_log_interval_ms,
+            position_log_last_ms: HashMap::new(),
+            position_snapshot_last_dir: HashMap::new(),
             launch_gate_mode,
             auto_approve_mode,
+            gas_limit_buffer_bps,
             pending_liquidity: HashMap::new(),
             pending_receipts: HashMap::new(),
             pending_exits,
@@ -501,7 +557,13 @@ impl Bot {
             candidate_store,
             positions,
             position_store_path,
+            positions_dirty: false,
+            positions_flush_tx: None,
             token_override_slots,
+            base_usd_price,
+            base_decimals,
+            total_realized_pnl_base: HashMap::new(),
+            token_decimals_cache: HashMap::new(),
         })
     }
 
@@ -520,6 +582,11 @@ impl Bot {
                         sent_at_ms,
                         last_sent_ms: sent_at_ms,
                         tx: None,
+                        entry_base_amount: U256::ZERO,
+                        min_amount_out: U256::ZERO,
+                        pnl_base_est: None,
+                        pnl_bps_est: None,
+                        pnl_dir_up: None,
                     },
                 )
                 .is_some()
@@ -534,13 +601,677 @@ impl Bot {
         pending
     }
 
-    fn persist_positions(&self) {
-        let Some(path) = &self.position_store_path else {
+    fn persist_positions(&mut self) {
+        if self.position_store_path.is_some() {
+            self.positions_dirty = true;
+            if let Some(tx) = &self.positions_flush_tx {
+                let _ = tx.try_send(());
+            }
+        }
+    }
+
+    fn maybe_start_positions_flush(
+        &mut self,
+        handle: &mut Option<JoinHandle<(PathBuf, Result<()>)>>,
+    ) {
+        if handle.is_some() || !self.positions_dirty {
+            return;
+        }
+        let Some(path) = self.position_store_path.clone() else {
+            self.positions_dirty = false;
             return;
         };
-        if let Err(err) = self.positions.persist_to(path) {
-            warn!(path = %path.display(), ?err, "position store persist failed");
+        let positions = self.positions.snapshot_positions();
+        self.positions_dirty = false;
+        *handle = Some(tokio::task::spawn_blocking(move || {
+            let res = PositionStore::persist_snapshot(&path, positions);
+            (path, res)
+        }));
+    }
+
+    fn notify(&self, message: String) {
+        if let Some(notifier) = &self.notifier {
+            notifier.notify(message);
         }
+    }
+
+    fn notify_entry_sent(
+        &self,
+        candidate: &LiquidityCandidate,
+        entry_tx_hash: B256,
+        entry_base_amount: U256,
+    ) {
+        if self.notifier.is_none() {
+            return;
+        }
+        let mut msg = String::new();
+        let _ = writeln!(msg, "🚀 Entry sent");
+        self.append_candidate_lines(&mut msg, candidate);
+        let _ = writeln!(msg, "entry_tx: {}", entry_tx_hash);
+        let _ = writeln!(
+            msg,
+            "{}",
+            self.format_base_amount_line("buy", candidate.base, entry_base_amount)
+        );
+        self.notify(msg);
+    }
+
+    fn notify_entry_failed(&self, candidate: &LiquidityCandidate, reason: &str, kind: DropKind) {
+        if self.notifier.is_none() {
+            return;
+        }
+        let mut msg = String::new();
+        let _ = writeln!(msg, "❌ Entry failed");
+        self.append_candidate_lines(&mut msg, candidate);
+        let _ = writeln!(msg, "reason: {}", reason);
+        let _ = writeln!(msg, "drop_kind: {:?}", kind);
+        self.notify(msg);
+    }
+
+    fn notify_position_opened(&self, position: &Position) {
+        if self.notifier.is_none() {
+            return;
+        }
+        let mut msg = String::new();
+        let _ = writeln!(msg, "✅ Position opened");
+        self.append_position_lines(&mut msg, position);
+        if let Some(price) = position.entry_price_base_per_token {
+            let _ = writeln!(
+                msg,
+                "entry_price: {}",
+                self.format_price(Some(price), position.token_decimals)
+            );
+        }
+        self.notify(msg);
+    }
+
+    fn notify_entry_filled(&self, position: &Position) {
+        if self.notifier.is_none() {
+            return;
+        }
+        if position.entry_base_spent.is_none() {
+            return;
+        }
+        let mut msg = String::new();
+        let _ = writeln!(msg, "🧾 Entry filled");
+        self.append_position_lines(&mut msg, position);
+        let _ = writeln!(
+            msg,
+            "entry_link: {}",
+            format_tx_link(position.entry_tx_hash)
+        );
+        if let Some(price) = position.entry_price_base_per_token {
+            let _ = writeln!(
+                msg,
+                "entry_price: {}",
+                self.format_price(Some(price), position.token_decimals)
+            );
+        }
+        self.notify(msg);
+    }
+
+    fn notify_position_snapshot(
+        &self,
+        position: &Position,
+        entry_price: Option<U256>,
+        current_price: Option<U256>,
+        pnl_bps: Option<U256>,
+        pnl_dir: Option<&'static str>,
+        open_secs: u64,
+    ) {
+        if self.notifier.is_none() {
+            return;
+        }
+        let mut msg = String::new();
+        let _ = writeln!(msg, "📊 Position snapshot");
+        self.append_position_lines(&mut msg, position);
+        let _ = writeln!(msg, "status: {:?}", position.status);
+        let _ = writeln!(
+            msg,
+            "entry_price: {}",
+            self.format_price(entry_price, position.token_decimals)
+        );
+        let _ = writeln!(
+            msg,
+            "current_price: {}",
+            self.format_price(current_price, position.token_decimals)
+        );
+        let _ = writeln!(
+            msg,
+            "pnl: {}",
+            self.format_pnl_line(position.base, self.entry_cost(position), pnl_bps, pnl_dir)
+        );
+        let _ = writeln!(msg, "open_for: {}s", open_secs);
+        self.notify(msg);
+    }
+
+    fn notify_exit_sent(
+        &self,
+        position: &Position,
+        exit_tx_hash: B256,
+        amount_in: U256,
+        min_amount_out: U256,
+        pnl_base_est: Option<U256>,
+        pnl_bps_est: Option<U256>,
+        pnl_dir_est: Option<&'static str>,
+    ) {
+        if self.notifier.is_none() {
+            return;
+        }
+        let mut msg = String::new();
+        let _ = writeln!(msg, "🟠 Exit sent");
+        self.append_position_lines(&mut msg, position);
+        let _ = writeln!(msg, "exit_tx: {}", exit_tx_hash);
+        let _ = writeln!(
+            msg,
+            "{}",
+            self.format_token_amount_line("sell_amount", amount_in, position.token_decimals)
+        );
+        let _ = writeln!(
+            msg,
+            "{}",
+            self.format_base_amount_line("min_out", position.base, min_amount_out)
+        );
+        let _ = writeln!(
+            msg,
+            "pnl_est: {}",
+            self.format_pnl_est_line(position.base, pnl_base_est, pnl_bps_est, pnl_dir_est)
+        );
+        self.notify(msg);
+    }
+
+    fn notify_exit_result(
+        &self,
+        position: Option<&Position>,
+        position_hash: B256,
+        exit_tx_hash: B256,
+        success: bool,
+        pnl: Option<&ExitPnl>,
+    ) {
+        if self.notifier.is_none() {
+            return;
+        }
+        let mut msg = String::new();
+        if success {
+            let _ = writeln!(msg, "✅ Exit confirmed");
+        } else {
+            let _ = writeln!(msg, "⚠️ Exit reverted");
+        }
+        if let Some(position) = position {
+            self.append_position_lines(&mut msg, position);
+        } else {
+            let _ = writeln!(msg, "position: {}", position_hash);
+        }
+        let _ = writeln!(msg, "exit_tx: {}", exit_tx_hash);
+        let _ = writeln!(msg, "exit_link: {}", format_tx_link(exit_tx_hash));
+        if success {
+            if let Some(position) = position {
+                if let Some(pnl) = pnl {
+                    let label = if pnl.exact {
+                        "realized"
+                    } else {
+                        "realized_est"
+                    };
+                    let percent = pnl
+                        .pnl_bps
+                        .map(|bps| format_percent_from_bps(bps, pnl.up))
+                        .unwrap_or_else(|| "n/a".to_string());
+                    let amount =
+                        self.format_signed_base_amount_with_usd(position.base, pnl.pnl, pnl.up);
+                    let out = self.format_base_amount_with_usd(position.base, pnl.out);
+                    let _ = writeln!(msg, "{label}: {percent} {amount} (out {out})");
+                    let _ = writeln!(msg, "gross_out: {out}");
+                    if let (Some(net_pnl), Some(net_up)) = (pnl.net_pnl, pnl.net_up) {
+                        let net =
+                            self.format_signed_base_amount_with_usd(position.base, net_pnl, net_up);
+                        let net_percent = pnl
+                            .net_bps
+                            .map(|bps| format_percent_from_bps(bps, net_up))
+                            .unwrap_or_else(|| "n/a".to_string());
+                        let _ = writeln!(msg, "net_pnl: {net_percent} {net}");
+                    }
+                }
+                if let Some(total) = self.total_realized_pnl_base.get(&position.base) {
+                    let _ = writeln!(
+                        msg,
+                        "total_realized: {}",
+                        self.format_signed_units_with_usd(position.base, *total)
+                    );
+                }
+            }
+        }
+        self.notify(msg);
+    }
+
+    fn append_candidate_lines(&self, buf: &mut String, candidate: &LiquidityCandidate) {
+        let _ = writeln!(buf, "token: {}", candidate.token);
+        let _ = writeln!(buf, "base: {}", candidate.base);
+        let _ = writeln!(buf, "router: {}", candidate.router);
+        if let Some(factory) = candidate.factory {
+            let _ = writeln!(buf, "factory: {}", factory);
+        }
+        if let Some(pair) = candidate.pair {
+            let _ = writeln!(buf, "pair: {}", pair);
+        }
+        if let Some(stable) = candidate.stable {
+            let _ = writeln!(buf, "stable: {}", stable);
+        }
+        let _ = writeln!(buf, "liquidity_raw: {}", candidate.implied_liquidity);
+        let _ = writeln!(buf, "add_liq_tx: {}", candidate.add_liq_tx_hash);
+    }
+
+    fn append_position_lines(&self, buf: &mut String, position: &Position) {
+        let _ = writeln!(buf, "token: {}", position.token);
+        let _ = writeln!(buf, "base: {}", position.base);
+        let _ = writeln!(buf, "router: {}", position.router);
+        if let Some(pair) = position.pair {
+            let _ = writeln!(buf, "pair: {}", pair);
+        }
+        if let Some(stable) = position.stable {
+            let _ = writeln!(buf, "stable: {}", stable);
+        }
+        let _ = writeln!(buf, "add_liq_tx: {}", position.add_liq_tx_hash);
+        let _ = writeln!(buf, "entry_tx: {}", position.entry_tx_hash);
+        let entry_cost = self.entry_cost(position);
+        let label = if position.entry_base_spent.is_some() {
+            "entry_spent"
+        } else {
+            "entry"
+        };
+        let _ = writeln!(
+            buf,
+            "{}",
+            self.format_base_amount_line(label, position.base, entry_cost)
+        );
+        if let Some(spent) = position.entry_base_spent {
+            if spent != position.entry_base_amount {
+                let _ = writeln!(
+                    buf,
+                    "{}",
+                    self.format_base_amount_line(
+                        "entry_config",
+                        position.base,
+                        position.entry_base_amount
+                    )
+                );
+            }
+        }
+        if let Some(amount) = position.entry_token_amount {
+            let _ = writeln!(
+                buf,
+                "{}",
+                self.format_token_amount_line(
+                    "entry_token_amount",
+                    amount,
+                    position.token_decimals
+                )
+            );
+        }
+    }
+
+    fn entry_cost(&self, position: &Position) -> U256 {
+        position
+            .entry_base_spent
+            .unwrap_or(position.entry_base_amount)
+    }
+
+    fn format_base_amount_line(&self, label: &str, base: Address, amount: U256) -> String {
+        let base_amount = self.format_base_amount(base, amount);
+        if let Some(usd) = self.base_amount_to_usd(base, amount) {
+            format!("{label}: {base_amount} (~${usd:.2})")
+        } else {
+            format!("{label}: {base_amount}")
+        }
+    }
+
+    fn format_base_amount(&self, base: Address, amount: U256) -> String {
+        let decimals = self.base_decimals_for(base);
+        match format_amount_with_decimals(amount, decimals, 4) {
+            Some(value) => format!("{value} base"),
+            None => amount.to_string(),
+        }
+    }
+
+    fn format_base_amount_with_usd(&self, base: Address, amount: U256) -> String {
+        let base_amount = self.format_base_amount(base, amount);
+        if let Some(usd) = self.base_amount_to_usd(base, amount) {
+            format!("{base_amount} (~${usd:.2})")
+        } else {
+            base_amount
+        }
+    }
+
+    fn format_token_amount_line(
+        &self,
+        label: &str,
+        amount: U256,
+        token_decimals: Option<u8>,
+    ) -> String {
+        if let Some(decimals) = token_decimals {
+            let precision = if decimals > 6 { 6 } else { decimals as usize };
+            if let Some(value) = format_amount_with_decimals(amount, decimals, precision) {
+                return format!("{label}: {value} token (raw {amount})");
+            }
+        }
+        format!("{label}_raw: {amount}")
+    }
+
+    fn format_signed_base_amount_with_usd(&self, base: Address, amount: U256, up: bool) -> String {
+        let sign = if up { "+" } else { "-" };
+        let decimals = self.base_decimals_for(base);
+        let base_value = match format_amount_with_decimals(amount, decimals, 4) {
+            Some(value) => format!("{sign}{value} base"),
+            None => format!("{sign}{amount}"),
+        };
+        if let Some(usd) = self.base_amount_to_usd(base, amount) {
+            format!("{base_value} (~${sign}{usd:.2})")
+        } else {
+            base_value
+        }
+    }
+
+    fn format_signed_units_with_usd(&self, base: Address, units: f64) -> String {
+        let sign = if units >= 0.0 { "+" } else { "-" };
+        let abs_units = units.abs();
+        let base_value = format!("{sign}{abs_units:.4} base");
+        if let Some(price) = self.base_usd_price_for(base) {
+            let usd = abs_units * price;
+            format!("{base_value} (~${sign}{usd:.2})")
+        } else {
+            base_value
+        }
+    }
+
+    fn format_pnl_line(
+        &self,
+        base: Address,
+        entry_base_amount: U256,
+        pnl_bps: Option<U256>,
+        pnl_dir: Option<&'static str>,
+    ) -> String {
+        let (Some(bps), Some(dir)) = (pnl_bps, pnl_dir) else {
+            return "n/a".to_string();
+        };
+        let up = dir == "up";
+        let percent = format_percent_from_bps(bps, up);
+        let pnl_base_est = entry_base_amount
+            .saturating_mul(bps)
+            .checked_div(U256::from(10_000u64))
+            .unwrap_or(U256::ZERO);
+        let pnl_amount = self.format_signed_base_amount_with_usd(base, pnl_base_est, up);
+        format!("{percent} ({pnl_amount})")
+    }
+
+    fn format_pnl_est_line(
+        &self,
+        base: Address,
+        pnl_base_est: Option<U256>,
+        pnl_bps_est: Option<U256>,
+        pnl_dir_est: Option<&'static str>,
+    ) -> String {
+        if pnl_base_est.is_none() && pnl_bps_est.is_none() {
+            return "n/a".to_string();
+        }
+        let up = pnl_dir_est == Some("up");
+        let mut parts = Vec::new();
+        if let Some(bps) = pnl_bps_est {
+            parts.push(format_percent_from_bps(bps, up));
+        }
+        if let Some(amount) = pnl_base_est {
+            parts.push(self.format_signed_base_amount_with_usd(base, amount, up));
+        }
+        parts.join(" ")
+    }
+
+    fn format_price(&self, price: Option<U256>, token_decimals: Option<u8>) -> String {
+        let Some(price) = price else {
+            return "n/a".to_string();
+        };
+        let Some(value) = u256_to_f64(price) else {
+            return price.to_string();
+        };
+        let ratio = value / 1_000_000_000_000_000_000f64;
+        let base_decimals = self.base_decimals_for(Address::ZERO) as i32;
+        let token_decimals = token_decimals.unwrap_or(self.base_decimals) as i32;
+        let scaled = ratio * 10f64.powi(token_decimals - base_decimals);
+        format!("{scaled:.8} base/token")
+    }
+
+    fn base_decimals_for(&self, base: Address) -> u8 {
+        if base == Address::ZERO || Some(base) == self.wrapped_native {
+            self.base_decimals
+        } else {
+            self.base_decimals
+        }
+    }
+
+    fn base_amount_to_units(&self, base: Address, amount: U256) -> Option<f64> {
+        let decimals = self.base_decimals_for(base) as i32;
+        let raw = u256_to_f64(amount)?;
+        Some(raw / 10f64.powi(decimals))
+    }
+
+    fn base_amount_to_usd(&self, base: Address, amount: U256) -> Option<f64> {
+        let units = self.base_amount_to_units(base, amount)?;
+        let price = self.base_usd_price_for(base)?;
+        Some(units * price)
+    }
+
+    fn base_usd_price_for(&self, _base: Address) -> Option<f64> {
+        self.base_usd_price.filter(|price| *price > 0.0)
+    }
+
+    fn estimate_exit_pnl(&self, entry: &PendingExit) -> Option<ExitPnl> {
+        let (pnl, up) = if let (Some(amount), Some(up)) = (entry.pnl_base_est, entry.pnl_dir_up) {
+            (amount, up)
+        } else {
+            if entry.entry_base_amount.is_zero() || entry.min_amount_out.is_zero() {
+                return None;
+            }
+            if entry.min_amount_out >= entry.entry_base_amount {
+                (entry.min_amount_out - entry.entry_base_amount, true)
+            } else {
+                (entry.entry_base_amount - entry.min_amount_out, false)
+            }
+        };
+        let pnl_bps = if entry.entry_base_amount.is_zero() {
+            None
+        } else {
+            Some(pnl.saturating_mul(U256::from(10_000u64)) / entry.entry_base_amount)
+        };
+        let out = if up {
+            entry.entry_base_amount.saturating_add(pnl)
+        } else {
+            entry.entry_base_amount.saturating_sub(pnl)
+        };
+        Some(ExitPnl {
+            out,
+            pnl,
+            pnl_bps,
+            up,
+            exact: false,
+            net_pnl: None,
+            net_up: None,
+            net_bps: None,
+        })
+    }
+
+    async fn realized_exit_pnl(
+        &self,
+        position: &Position,
+        block: u64,
+        gas_used: u128,
+        effective_gas_price: u128,
+    ) -> Result<Option<ExitPnl>> {
+        if block == 0 || self.tx_builder.owner == Address::ZERO {
+            return Ok(None);
+        }
+        let before = self
+            .base_balance_at(
+                position.base,
+                self.tx_builder.owner,
+                block.saturating_sub(1),
+            )
+            .await?;
+        let after = self
+            .base_balance_at(position.base, self.tx_builder.owner, block)
+            .await?;
+        let gas_cost = if position.base == Address::ZERO {
+            U256::from(gas_used.saturating_mul(effective_gas_price))
+        } else {
+            U256::ZERO
+        };
+        let adjusted_after = after.saturating_add(gas_cost);
+        let net_out = if after >= before {
+            after - before
+        } else {
+            U256::ZERO
+        };
+        if adjusted_after < before {
+            return Ok(None);
+        }
+        let out = adjusted_after - before;
+        let entry_cost = self.entry_cost(position);
+        let (pnl, up) = if out >= entry_cost {
+            (out - entry_cost, true)
+        } else {
+            (entry_cost - out, false)
+        };
+        let (net_pnl, net_up) = if entry_cost.is_zero() {
+            (None, None)
+        } else if net_out >= entry_cost {
+            (Some(net_out - entry_cost), Some(true))
+        } else {
+            (Some(entry_cost - net_out), Some(false))
+        };
+        let pnl_bps = if entry_cost.is_zero() {
+            None
+        } else {
+            Some(pnl.saturating_mul(U256::from(10_000u64)) / entry_cost)
+        };
+        let net_bps = if let (Some(net_pnl), Some(_)) = (net_pnl, net_up) {
+            if entry_cost.is_zero() {
+                None
+            } else {
+                Some(net_pnl.saturating_mul(U256::from(10_000u64)) / entry_cost)
+            }
+        } else {
+            None
+        };
+        Ok(Some(ExitPnl {
+            out,
+            pnl,
+            pnl_bps,
+            up,
+            exact: true,
+            net_pnl,
+            net_up,
+            net_bps,
+        }))
+    }
+
+    async fn base_balance_at(&self, base: Address, account: Address, block: u64) -> Result<U256> {
+        if base == Address::ZERO {
+            let balance = self
+                .chain
+                .http
+                .get_balance(account)
+                .block_id(BlockId::number(block))
+                .await?;
+            Ok(balance)
+        } else {
+            self.token_balance_at_block(base, account, block).await
+        }
+    }
+
+    async fn token_balance_at_block(
+        &self,
+        token: Address,
+        account: Address,
+        block: u64,
+    ) -> Result<U256> {
+        let call = IERC20::balanceOfCall { account };
+        let tx = TransactionRequest {
+            to: Some(TxKind::Call(token)),
+            input: TransactionInput::new(call.abi_encode().into()),
+            ..Default::default()
+        };
+        let data = self
+            .chain
+            .http
+            .call(tx)
+            .block(BlockId::number(block))
+            .await?;
+        let balance = IERC20::balanceOfCall::abi_decode_returns(&data)?;
+        Ok(balance)
+    }
+
+    fn record_realized_pnl(&mut self, base: Address, amount: U256, up: bool) {
+        let Some(units) = self.base_amount_to_units(base, amount) else {
+            return;
+        };
+        let entry = self.total_realized_pnl_base.entry(base).or_insert(0.0);
+        if up {
+            *entry += units;
+        } else {
+            *entry -= units;
+        }
+    }
+
+    async fn realized_entry_fill(
+        &self,
+        position: &Position,
+        block: u64,
+        gas_used: Option<u64>,
+        gas_price: Option<u128>,
+    ) -> Result<Option<(U256, U256)>> {
+        if block == 0 || self.tx_builder.owner == Address::ZERO {
+            return Ok(None);
+        }
+        let before_base = self
+            .base_balance_at(
+                position.base,
+                self.tx_builder.owner,
+                block.saturating_sub(1),
+            )
+            .await?;
+        let after_base = self
+            .base_balance_at(position.base, self.tx_builder.owner, block)
+            .await?;
+        let mut base_spent = if before_base >= after_base {
+            before_base - after_base
+        } else {
+            U256::ZERO
+        };
+        if position.base == Address::ZERO {
+            if let (Some(gas_used), Some(gas_price)) = (gas_used, gas_price) {
+                let gas_cost = U256::from(gas_used as u128 * gas_price);
+                if base_spent > gas_cost {
+                    base_spent -= gas_cost;
+                } else {
+                    base_spent = U256::ZERO;
+                }
+            }
+        }
+        let before_token = self
+            .token_balance_at_block(
+                position.token,
+                self.tx_builder.contract,
+                block.saturating_sub(1),
+            )
+            .await?;
+        let after_token = self
+            .token_balance_at_block(position.token, self.tx_builder.contract, block)
+            .await?;
+        let token_received = if after_token >= before_token {
+            after_token - before_token
+        } else {
+            U256::ZERO
+        };
+        if base_spent.is_zero() && token_received.is_zero() {
+            return Ok(None);
+        }
+        Ok(Some((base_spent, token_received)))
     }
 
     async fn verify_router_support(
@@ -621,10 +1352,9 @@ impl Bot {
                     if let Some((token_a, token_b, stable)) =
                         Self::find_solidly_pair(provider, factory, &tokens).await
                     {
-                        sellability_enabled = Self::verify_solidly_router(
-                            provider, router, token_a, token_b, stable,
-                        )
-                        .await;
+                        sellability_enabled =
+                            Self::verify_solidly_router(provider, router, token_a, token_b, stable)
+                                .await;
                         if !sellability_enabled {
                             warn!(
                                 router = %router,
@@ -690,10 +1420,7 @@ impl Bot {
                 let value = if meta.sellability_enabled { 1 } else { 0 };
                 metrics
                     .router_sellability
-                    .with_label_values(&[
-                        &router.to_string(),
-                        meta.kind.as_str(),
-                    ])
+                    .with_label_values(&[&router.to_string(), meta.kind.as_str()])
                     .set(value);
             }
         }
@@ -783,9 +1510,7 @@ impl Bot {
 
         let tokens = self.router_verification_tokens();
         if tokens.len() < 2 {
-            debug!(
-                "router sellability recheck skipped; need at least two non-zero base tokens"
-            );
+            debug!("router sellability recheck skipped; need at least two non-zero base tokens");
             return Ok(());
         }
 
@@ -840,13 +1565,10 @@ impl Bot {
             let mut newly_enabled = false;
             let mut previous_kind = None;
             let final_enabled = {
-                let entry = self
-                    .router_meta
-                    .entry(router)
-                    .or_insert(RouterMeta {
-                        kind,
-                        sellability_enabled: false,
-                    });
+                let entry = self.router_meta.entry(router).or_insert(RouterMeta {
+                    kind,
+                    sellability_enabled: false,
+                });
                 if entry.kind != kind {
                     previous_kind = Some(entry.kind);
                     entry.kind = kind;
@@ -895,10 +1617,9 @@ impl Bot {
         }
         let token_a = tokens[0];
         let token_b = tokens[1];
-        let solidly_ok =
-            get_pair_address_solidly(provider, factory, token_a, token_b, false)
-                .await
-                .is_ok();
+        let solidly_ok = get_pair_address_solidly(provider, factory, token_a, token_b, false)
+            .await
+            .is_ok();
         let v2_ok = get_pair_address(provider, factory, token_a, token_b)
             .await
             .is_ok();
@@ -916,9 +1637,7 @@ impl Bot {
     ) -> Option<(Address, Address)> {
         for (idx, &token_a) in tokens.iter().enumerate() {
             for &token_b in tokens.iter().skip(idx + 1) {
-                if let Ok(Some(_)) =
-                    get_pair_address(provider, factory, token_a, token_b).await
-                {
+                if let Ok(Some(_)) = get_pair_address(provider, factory, token_a, token_b).await {
                     return Some((token_a, token_b));
                 }
             }
@@ -934,14 +1653,8 @@ impl Bot {
         for (idx, &token_a) in tokens.iter().enumerate() {
             for &token_b in tokens.iter().skip(idx + 1) {
                 for stable in [false, true] {
-                    if let Ok(Some(_)) = get_pair_address_solidly(
-                        provider,
-                        factory,
-                        token_a,
-                        token_b,
-                        stable,
-                    )
-                    .await
+                    if let Ok(Some(_)) =
+                        get_pair_address_solidly(provider, factory, token_a, token_b, stable).await
                     {
                         return Some((token_a, token_b, stable));
                     }
@@ -1048,32 +1761,50 @@ impl Bot {
             self.chain.http.clone(),
             self.cfg.mempool.tx_fetch_timeout_ms,
         );
+        let fetch_limit = self.cfg.mempool.fetch_concurrency.max(1);
+        let fetch_queue_limit = fetch_limit
+            .saturating_mul(FETCH_QUEUE_MULTIPLIER)
+            .max(fetch_limit);
+        let mut fetch_queue: VecDeque<B256> = VecDeque::new();
+        let mut fetch_futures: FuturesUnordered<FetchFuture> = FuturesUnordered::new();
+        let (positions_flush_tx, mut positions_flush_rx) = mpsc::channel(1);
+        self.positions_flush_tx = Some(positions_flush_tx);
         let mut pending_rx = pending_rx;
         let mut heads_rx = heads_rx;
         let mut txpool_rx = txpool_rx;
-        let nonce_sync_enabled = self.tx_builder.owner != Address::ZERO
-            && self.cfg.executor.nonce_sync_interval_ms > 0;
+        let nonce_sync_enabled =
+            self.tx_builder.owner != Address::ZERO && self.cfg.executor.nonce_sync_interval_ms > 0;
         let mut nonce_sync = tokio::time::interval(Duration::from_millis(
             self.cfg.executor.nonce_sync_interval_ms.max(1),
         ));
+        nonce_sync.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let receipt_poll_enabled = self.cfg.executor.receipt_poll_interval_ms > 0;
         let mut receipt_poll = tokio::time::interval(Duration::from_millis(
             self.cfg.executor.receipt_poll_interval_ms.max(1),
         ));
+        receipt_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let wait_for_mine_enabled = self.wait_for_mine_enabled();
         let mut wait_for_mine_poll = tokio::time::interval(Duration::from_millis(
             self.cfg.strategy.wait_for_mine_poll_interval_ms.max(1),
         ));
+        wait_for_mine_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let exit_poll_enabled = self.exit_loop_enabled();
-        let mut exit_poll =
-            tokio::time::interval(Duration::from_millis(EXIT_POLL_INTERVAL_MS));
+        let mut exit_poll = tokio::time::interval(Duration::from_millis(EXIT_POLL_INTERVAL_MS));
+        exit_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let sellability_recheck_enabled = self.cfg.dex.sellability_recheck_interval_ms > 0;
         let mut sellability_recheck = tokio::time::interval(Duration::from_millis(
-            self.cfg
-                .dex
-                .sellability_recheck_interval_ms
-                .max(1),
+            self.cfg.dex.sellability_recheck_interval_ms.max(1),
         ));
+        sellability_recheck.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut prune_tick = tokio::time::interval(Duration::from_millis(PRUNE_INTERVAL_MS));
+        prune_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut positions_flush_tick =
+            tokio::time::interval(Duration::from_millis(POSITION_FLUSH_INTERVAL_MS));
+        positions_flush_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut positions_flush: Option<JoinHandle<(PathBuf, Result<()>)>> = None;
+        let mut fetch_drain_tick =
+            tokio::time::interval(Duration::from_millis(FETCH_DRAIN_INTERVAL_MS));
+        fetch_drain_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         info!("bot running");
         if self.cfg.strategy.wait_for_mine && !wait_for_mine_enabled {
@@ -1089,8 +1820,28 @@ impl Bot {
         loop {
             select! {
                 Some(hash) = pending_rx.recv() => {
-                    self.handle_hash(&fetcher, hash).await?;
-                    self.counters.maybe_log(now_ms());
+                    let now = now_ms();
+                    if self.should_fetch_hash(hash, now) {
+                        if fetch_futures.len() < fetch_limit {
+                            let fetcher = fetcher.clone();
+                            fetch_futures.push(Box::pin(async move {
+                                let tx = match fetcher.fetch(hash).await {
+                                    Ok(tx) => tx,
+                                    Err(err) => {
+                                        warn!(?err, %hash, "tx fetch failed");
+                                        None
+                                    }
+                                };
+                                FetchedTx { tx }
+                            }));
+                        } else if fetch_queue.len() < fetch_queue_limit {
+                            fetch_queue.push_back(hash);
+                        } else {
+                            self.counters.totals.fetch_dropped =
+                                self.counters.totals.fetch_dropped.saturating_add(1);
+                        }
+                    }
+                    self.counters.maybe_log(now);
                 }
                 Some(hash) = async {
                     match txpool_rx.as_mut() {
@@ -1098,14 +1849,112 @@ impl Bot {
                         None => None,
                     }
                 } => {
-                    self.handle_hash(&fetcher, hash).await?;
-                    self.counters.maybe_log(now_ms());
+                    let now = now_ms();
+                    if self.should_fetch_hash(hash, now) {
+                        if fetch_futures.len() < fetch_limit {
+                            let fetcher = fetcher.clone();
+                            fetch_futures.push(Box::pin(async move {
+                                let tx = match fetcher.fetch(hash).await {
+                                    Ok(tx) => tx,
+                                    Err(err) => {
+                                        warn!(?err, %hash, "tx fetch failed");
+                                        None
+                                    }
+                                };
+                                FetchedTx { tx }
+                            }));
+                        } else if fetch_queue.len() < fetch_queue_limit {
+                            fetch_queue.push_back(hash);
+                        } else {
+                            self.counters.totals.fetch_dropped =
+                                self.counters.totals.fetch_dropped.saturating_add(1);
+                        }
+                    }
+                    self.counters.maybe_log(now);
                 }
                 Some(head) = heads_rx.recv() => {
                     self.latest_head = Some(head);
                     self.latest_head_seen_ms = Some(now_ms());
                     debug!(block = head, "new head");
                     self.counters.maybe_log(now_ms());
+                }
+                Some(fetched) = fetch_futures.next(), if !fetch_futures.is_empty() => {
+                    if let Some(tx) = fetched.tx {
+                        self.counters.totals.tx_fetched =
+                            self.counters.totals.tx_fetched.saturating_add(1);
+                        if let Err(err) = self.handle_tx(tx).await {
+                            warn!(?err, "tx handling failed");
+                        }
+                    } else {
+                        self.counters.totals.tx_missing =
+                            self.counters.totals.tx_missing.saturating_add(1);
+                    }
+                    while fetch_futures.len() < fetch_limit {
+                        let Some(next_hash) = fetch_queue.pop_front() else {
+                            break;
+                        };
+                        let fetcher = fetcher.clone();
+                        fetch_futures.push(Box::pin(async move {
+                            let tx = match fetcher.fetch(next_hash).await {
+                                Ok(tx) => tx,
+                                Err(err) => {
+                                    warn!(?err, %next_hash, "tx fetch failed");
+                                    None
+                                }
+                            };
+                            FetchedTx { tx }
+                        }));
+                    }
+                }
+                _ = fetch_drain_tick.tick(), if fetch_futures.is_empty() && !fetch_queue.is_empty() => {
+                    while fetch_futures.len() < fetch_limit {
+                        let Some(next_hash) = fetch_queue.pop_front() else {
+                            break;
+                        };
+                        let fetcher = fetcher.clone();
+                        fetch_futures.push(Box::pin(async move {
+                            let tx = match fetcher.fetch(next_hash).await {
+                                Ok(tx) => tx,
+                                Err(err) => {
+                                    warn!(?err, %next_hash, "tx fetch failed");
+                                    None
+                                }
+                            };
+                            FetchedTx { tx }
+                        }));
+                    }
+                }
+                _ = prune_tick.tick() => {
+                    self.candidate_store.prune(now_ms());
+                }
+                Some(_) = positions_flush_rx.recv() => {
+                    self.maybe_start_positions_flush(&mut positions_flush);
+                }
+                _ = positions_flush_tick.tick() => {
+                    self.maybe_start_positions_flush(&mut positions_flush);
+                }
+                result = async {
+                    positions_flush.as_mut().unwrap().await
+                }, if positions_flush.is_some() => {
+                    let mut flush_failed = false;
+                    match result {
+                        Ok((path, result)) => {
+                            if let Err(err) = result {
+                                warn!(path = %path.display(), ?err, "position store persist failed");
+                                self.positions_dirty = true;
+                                flush_failed = true;
+                            }
+                        }
+                        Err(err) => {
+                            warn!(?err, "position store persist task failed");
+                            self.positions_dirty = true;
+                            flush_failed = true;
+                        }
+                    }
+                    positions_flush = None;
+                    if self.positions_dirty && !flush_failed {
+                        self.maybe_start_positions_flush(&mut positions_flush);
+                    }
                 }
                 _ = nonce_sync.tick(), if nonce_sync_enabled => {
                     if let Err(err) = self.sync_nonce().await {
@@ -1139,45 +1988,30 @@ impl Bot {
         }
     }
 
-    async fn handle_hash(&mut self, fetcher: &TxFetcher, hash: B256) -> Result<()> {
-        self.counters.totals.hashes_seen =
-            self.counters.totals.hashes_seen.saturating_add(1);
-        let now = now_ms();
-        self.candidate_store.prune(now);
+    fn should_fetch_hash(&mut self, hash: B256, now: u64) -> bool {
+        self.counters.totals.hashes_seen = self.counters.totals.hashes_seen.saturating_add(1);
         if !self.dedupe.check_and_update(hash, now) {
             self.counters.totals.dedupe_dropped =
                 self.counters.totals.dedupe_dropped.saturating_add(1);
             if let Some(metrics) = &self.metrics {
                 metrics.dedup_hits.inc();
             }
-            return Ok(());
+            return false;
         }
+        true
+    }
 
-        let tx = match fetcher.fetch(hash).await? {
-            Some(tx) => {
-                self.counters.totals.tx_fetched =
-                    self.counters.totals.tx_fetched.saturating_add(1);
-                tx
-            }
-            None => {
-                self.counters.totals.tx_missing =
-                    self.counters.totals.tx_missing.saturating_add(1);
-                return Ok(());
-            }
-        };
-
+    async fn handle_tx(&mut self, tx: MempoolTx) -> Result<()> {
+        let now = now_ms();
         if let Some(mut candidate) = self.detect_liquidity_add(&tx)? {
-            if self
-                .candidate_store
-                .is_terminal(candidate.add_liq_tx_hash)
+            if self.candidate_store.is_terminal(candidate.add_liq_tx_hash)
                 || self
                     .candidate_store
                     .has_execution(candidate.add_liq_tx_hash)
             {
                 return Ok(());
             }
-            self.candidate_store
-                .track_detected(candidate.clone(), now);
+            self.candidate_store.track_detected(candidate.clone(), now);
             self.resolve_candidate_pair(&mut candidate).await?;
             self.candidate_store
                 .set_state(candidate.clone(), BotState::Qualifying, now);
@@ -1193,22 +2027,38 @@ impl Bot {
             };
             let wait_for_mine_enabled = self.wait_for_mine_enabled();
             if wait_for_mine_enabled {
+                let mut same_block_deferral = None;
                 if self.cfg.strategy.same_block_attempt
                     && self.same_block_attempt_allowed(&candidate).await
                 {
-                    if let Err(err) = self
+                    match self
                         .execute_ready_candidate(candidate.clone(), risk_base, None, false, true)
                         .await
                     {
-                        warn!(?err, "same-block attempt failed; deferring to receipt path");
+                        Ok(ExecutionAttemptOutcome::Deferred(reason)) => {
+                            same_block_deferral = Some(reason);
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            warn!(?err, "same-block attempt failed; deferring to receipt path");
+                        }
                     }
-                    if self.candidate_store.has_execution(candidate.add_liq_tx_hash)
+                    if self
+                        .candidate_store
+                        .has_execution(candidate.add_liq_tx_hash)
                         || self.candidate_store.is_terminal(candidate.add_liq_tx_hash)
                     {
                         return Ok(());
                     }
                 }
-                self.enqueue_pending_liquidity(candidate.clone(), now_ms());
+                match same_block_deferral {
+                    Some(DeferredReason::BuyAmountUnavailable) => {
+                        self.defer_pending_liquidity_for_unavailable(candidate.clone(), now_ms());
+                    }
+                    _ => {
+                        self.enqueue_pending_liquidity(candidate.clone(), now_ms());
+                    }
+                }
                 info!(
                     token = %candidate.token,
                     base = %candidate.base,
@@ -1262,8 +2112,7 @@ impl Bot {
                     return Ok(None);
                 }
 
-                self.counters.totals.candidates =
-                    self.counters.totals.candidates.saturating_add(1);
+                self.counters.totals.candidates = self.counters.totals.candidates.saturating_add(1);
                 self.record_candidate_metric();
                 Ok(Some(LiquidityCandidate {
                     token,
@@ -1291,8 +2140,7 @@ impl Bot {
                     return Ok(None);
                 }
 
-                self.counters.totals.candidates =
-                    self.counters.totals.candidates.saturating_add(1);
+                self.counters.totals.candidates = self.counters.totals.candidates.saturating_add(1);
                 self.record_candidate_metric();
                 Ok(Some(LiquidityCandidate {
                     token: add.token,
@@ -1323,8 +2171,7 @@ impl Bot {
                     return Ok(None);
                 }
 
-                self.counters.totals.candidates =
-                    self.counters.totals.candidates.saturating_add(1);
+                self.counters.totals.candidates = self.counters.totals.candidates.saturating_add(1);
                 self.record_candidate_metric();
                 Ok(Some(LiquidityCandidate {
                     token,
@@ -1352,8 +2199,7 @@ impl Bot {
                     return Ok(None);
                 }
 
-                self.counters.totals.candidates =
-                    self.counters.totals.candidates.saturating_add(1);
+                self.counters.totals.candidates = self.counters.totals.candidates.saturating_add(1);
                 self.record_candidate_metric();
                 Ok(Some(LiquidityCandidate {
                     token: add.token,
@@ -1426,10 +2272,7 @@ impl Bot {
             return Ok(LaunchGateDecision::Allow);
         }
 
-        let pair = match self
-            .launch_gate_pair_address(candidate, base_token)
-            .await?
-        {
+        let pair = match self.launch_gate_pair_address(candidate, base_token).await? {
             Some(pair) => pair,
             None => {
                 return Ok(self.launch_gate_unavailable("launch gate requires pair address"));
@@ -1440,9 +2283,7 @@ impl Bot {
             Some(block) => match block.checked_sub(1) {
                 Some(prior) => prior,
                 None => {
-                    return Ok(self.launch_gate_unavailable(
-                        "launch gate prior block unavailable",
-                    ))
+                    return Ok(self.launch_gate_unavailable("launch gate prior block unavailable"))
                 }
             },
             None => {
@@ -1455,27 +2296,24 @@ impl Bot {
                     }
                 };
                 let Some(prior_block) = latest_block.checked_sub(1) else {
-                    return Ok(self.launch_gate_unavailable(
-                        "launch gate prior block unavailable",
-                    ));
+                    return Ok(self.launch_gate_unavailable("launch gate prior block unavailable"));
                 };
                 prior_block
             }
         };
 
-        let exists_prior = match contract_exists_at_block(&self.chain.http, pair, prior_block).await
-        {
-            Ok(exists) => exists,
-            Err(err) => {
-                let reason = format!("launch gate code check failed: {err}");
-                if is_historical_state_unavailable(&reason) {
-                    return Ok(self.launch_gate_unavailable(
-                        "launch gate historical state unavailable",
-                    ));
+        let exists_prior =
+            match contract_exists_at_block(&self.chain.http, pair, prior_block).await {
+                Ok(exists) => exists,
+                Err(err) => {
+                    let reason = format!("launch gate code check failed: {err}");
+                    if is_historical_state_unavailable(&reason) {
+                        return Ok(self
+                            .launch_gate_unavailable("launch gate historical state unavailable"));
+                    }
+                    return Ok(self.launch_gate_unavailable(reason));
                 }
-                return Ok(self.launch_gate_unavailable(reason));
-            }
-        };
+            };
         if !exists_prior {
             return Ok(LaunchGateDecision::Allow);
         }
@@ -1483,16 +2321,14 @@ impl Bot {
         let reserves = match get_reserves_at_block(&self.chain.http, pair, prior_block).await {
             Ok(Some(reserves)) => reserves,
             Ok(None) => {
-                return Ok(self.launch_gate_unavailable(
-                    "launch gate reserves unavailable",
-                ));
+                return Ok(self.launch_gate_unavailable("launch gate reserves unavailable"));
             }
             Err(err) => {
                 let reason = format!("launch gate reserve check failed: {err}");
                 if is_historical_state_unavailable(&reason) {
-                    return Ok(self.launch_gate_unavailable(
-                        "launch gate historical state unavailable",
-                    ));
+                    return Ok(
+                        self.launch_gate_unavailable("launch gate historical state unavailable")
+                    );
                 }
                 return Ok(self.launch_gate_unavailable(reason));
             }
@@ -1556,6 +2392,227 @@ impl Bot {
         }
     }
 
+    async fn wallet_balance_for_base(&self, base: Address) -> BuyAmountResult<U256> {
+        if base == Address::ZERO {
+            self.chain
+                .http
+                .get_balance(self.tx_builder.owner)
+                .await
+                .map_err(|err| {
+                    BuyAmountError::BalanceUnavailable(format!(
+                        "native balance lookup failed: {err}"
+                    ))
+                })
+        } else {
+            self.token_balance(base, self.tx_builder.owner)
+                .await
+                .map_err(|err| {
+                    BuyAmountError::BalanceUnavailable(format!(
+                        "token balance lookup failed: {err}"
+                    ))
+                })
+        }
+    }
+
+    fn apply_buy_amount_limits(
+        &self,
+        base: Address,
+        liquidity_amount: U256,
+        wallet_balance: U256,
+    ) -> BuyAmountResult<U256> {
+        let available_balance = if base == Address::ZERO {
+            if wallet_balance <= self.buy_amount_native_reserve {
+                return Err(BuyAmountError::InsufficientFunds(
+                    "wallet balance below native reserve",
+                ));
+            }
+            wallet_balance - self.buy_amount_native_reserve
+        } else {
+            wallet_balance
+        };
+
+        let mut amount = match self.buy_amount_mode {
+            BuyAmountMode::Liquidity => liquidity_amount,
+            BuyAmountMode::Fixed => self.buy_amount_fixed,
+            BuyAmountMode::WalletPct => {
+                available_balance * U256::from(self.buy_amount_wallet_bps) / U256::from(10_000u64)
+            }
+        };
+
+        if !self.buy_amount_min.is_zero() && amount < self.buy_amount_min {
+            amount = self.buy_amount_min;
+        }
+        if !self.buy_amount_max.is_zero() && amount > self.buy_amount_max {
+            amount = self.buy_amount_max;
+        }
+        if self.buy_amount_max_liquidity_bps > 0 {
+            let cap = liquidity_amount * U256::from(self.buy_amount_max_liquidity_bps)
+                / U256::from(10_000u64);
+            if !cap.is_zero() && amount > cap {
+                amount = cap;
+            }
+        }
+
+        if amount.is_zero() {
+            return Err(BuyAmountError::Invalid("resolved buy amount is zero"));
+        }
+        if amount > available_balance {
+            return Err(BuyAmountError::InsufficientFunds(
+                "wallet balance too low for buy amount",
+            ));
+        }
+
+        Ok(amount)
+    }
+
+    async fn resolve_buy_amount(&self, candidate: &LiquidityCandidate) -> BuyAmountResult<U256> {
+        let liquidity_amount = candidate.implied_liquidity;
+        let wallet_balance = self.wallet_balance_for_base(candidate.base).await?;
+        self.apply_buy_amount_limits(candidate.base, liquidity_amount, wallet_balance)
+    }
+
+    async fn apply_gas_limit(&self, tx: &mut TransactionRequest) -> Result<()> {
+        if self.gas_limit_buffer_bps == 0 {
+            return Ok(());
+        }
+        if tx.gas.is_some() {
+            return Ok(());
+        }
+        let mut estimate_tx = tx.clone();
+        estimate_tx.nonce = None;
+        estimate_tx.gas = None;
+        let estimate = self.chain.http.estimate_gas(estimate_tx).await?;
+        let gas = estimate.saturating_mul(10_000u64 + self.gas_limit_buffer_bps as u64) / 10_000u64;
+        tx.gas = Some(gas);
+        Ok(())
+    }
+
+    fn has_pending_sends(&self) -> bool {
+        !self.pending_receipts.is_empty() || !self.pending_exits.is_empty()
+    }
+
+    async fn next_send_nonce(&self) -> Result<u64> {
+        if self.has_pending_sends() {
+            self.sync_nonce().await?;
+        } else {
+            self.sync_nonce_if_txpool_pending().await?;
+        }
+        Ok(self.nonce.next_nonce())
+    }
+
+    fn txpool_lookup_enabled(&self) -> bool {
+        self.cfg.mempool.mode.contains("txpool")
+    }
+
+    async fn sync_nonce_if_txpool_pending(&self) -> Result<()> {
+        if !self.txpool_lookup_enabled() {
+            return Ok(());
+        }
+        if self.tx_builder.owner == Address::ZERO {
+            return Ok(());
+        }
+        let content = match self
+            .chain
+            .http
+            .txpool_content_from(self.tx_builder.owner)
+            .await
+        {
+            Ok(content) => content,
+            Err(_) => return Ok(()),
+        };
+        if !content.pending.is_empty() || !content.queued.is_empty() {
+            self.sync_nonce().await?;
+        }
+        Ok(())
+    }
+
+    async fn txpool_hash_for_request(&self, request: &TransactionRequest) -> Option<B256> {
+        if !self.txpool_lookup_enabled() {
+            return None;
+        }
+        if self.tx_builder.owner == Address::ZERO {
+            return None;
+        }
+        let nonce = request.nonce?;
+        let content = self
+            .chain
+            .http
+            .txpool_content_from(self.tx_builder.owner)
+            .await
+            .ok()?;
+        for (raw_nonce, pool_tx) in content
+            .pending
+            .into_iter()
+            .chain(content.queued.into_iter())
+        {
+            if parse_txpool_nonce(&raw_nonce) == Some(nonce) {
+                if txpool_matches_request(request, &pool_tx) {
+                    return Some(pool_tx.tx_hash());
+                }
+                warn!(
+                    nonce,
+                    tx_hash = %pool_tx.tx_hash(),
+                    "txpool nonce match but payload mismatch; skipping existing hash"
+                );
+            }
+        }
+        None
+    }
+
+    async fn send_with_nonce_retry(&self, tx: &mut TransactionRequest) -> Result<B256> {
+        let mut attempts = 0u8;
+        let max_retries = self.cfg.executor.nonce_retry_max_retries;
+        loop {
+            match self.sender.send(tx.clone()).await {
+                Ok(hash) => return Ok(hash),
+                Err(err) => {
+                    let reason = err.to_string();
+                    let nonce_too_low = is_nonce_too_low(&reason);
+                    let nonce_too_high = is_nonce_too_high(&reason);
+                    let already_known = is_tx_already_known(&reason);
+                    let underpriced = is_tx_underpriced(&reason);
+                    if !nonce_too_low && !nonce_too_high && !already_known && !underpriced {
+                        return Err(err.into());
+                    }
+                    if already_known && tx.nonce.is_some() {
+                        if let Some(hash) = self.txpool_hash_for_request(tx).await {
+                            info!(%hash, reason = %reason, "tx already in txpool; tracking existing");
+                            return Ok(hash);
+                        }
+                    }
+                    if attempts >= max_retries {
+                        return Err(err.into());
+                    }
+                    attempts = attempts.saturating_add(1);
+                    warn!(
+                        reason = %reason,
+                        attempt = attempts,
+                        "nonce/fee error; retrying"
+                    );
+                    let delay_ms = self.cfg.executor.nonce_retry_delay_ms;
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    if nonce_too_high {
+                        self.sync_nonce_allow_decrease().await?;
+                        tx.nonce = Some(self.nonce.next_nonce());
+                        continue;
+                    }
+                    if nonce_too_low {
+                        self.sync_nonce().await?;
+                        tx.nonce = Some(self.nonce.next_nonce());
+                        continue;
+                    }
+                    let bump_pct = self.cfg.executor.bump_pct;
+                    if bump_pct == 0 || !bump_tx_fees(tx, bump_pct) {
+                        warn!(reason = %reason, "fee bump skipped: bump_pct=0 or missing fee fields");
+                        return Err(err.into());
+                    }
+                }
+            }
+        }
+    }
+
     async fn execute_candidate(&self, candidate: LiquidityCandidate) -> Result<ExecutionOutcome> {
         if self.tx_builder.owner == Address::ZERO {
             warn!("owner key not configured; skipping execution");
@@ -1565,11 +2622,51 @@ impl Bot {
             ));
         }
 
+        let amount_in = match self.resolve_buy_amount(&candidate).await {
+            Ok(amount) => amount,
+            Err(BuyAmountError::BalanceUnavailable(reason)) => {
+                warn!(
+                    reason = %reason,
+                    token = %candidate.token,
+                    base = %candidate.base,
+                    "buy amount unavailable; skipping execution"
+                );
+                return Ok(ExecutionOutcome::Skipped(
+                    BUY_AMOUNT_UNAVAILABLE_REASON,
+                    DropKind::Transient,
+                ));
+            }
+            Err(BuyAmountError::InsufficientFunds(reason)) => {
+                warn!(
+                    reason = %reason,
+                    token = %candidate.token,
+                    base = %candidate.base,
+                    "buy amount insufficient; skipping execution"
+                );
+                return Ok(ExecutionOutcome::Skipped(
+                    "insufficient funds for buy",
+                    DropKind::Terminal,
+                ));
+            }
+            Err(BuyAmountError::Invalid(reason)) => {
+                warn!(
+                    reason = %reason,
+                    token = %candidate.token,
+                    base = %candidate.base,
+                    "buy amount invalid; skipping execution"
+                );
+                return Ok(ExecutionOutcome::Skipped(
+                    "buy amount invalid",
+                    DropKind::Terminal,
+                ));
+            }
+        };
+
         let deadline = U256::from(now_ms() / 1000 + self.cfg.dex.deadline_secs as u64);
         let max_block_number = self.resolve_max_block_number().await?;
         if candidate.base != Address::ZERO {
             if let Err(err) = self
-                .ensure_base_token_approval(candidate.base, candidate.implied_liquidity)
+                .ensure_base_token_approval(candidate.base, amount_in)
                 .await
             {
                 warn!(
@@ -1583,7 +2680,7 @@ impl Bot {
                 ));
             }
         }
-        let nonce = self.nonce.next_nonce();
+        let nonce = self.next_send_nonce().await?;
         let buy_recipient = self.tx_builder.contract;
 
         let tx = if candidate.base == Address::ZERO {
@@ -1603,7 +2700,7 @@ impl Bot {
                     token_in: wrapped_native,
                     token_out: candidate.token,
                     stable,
-                    amount_in: candidate.implied_liquidity,
+                    amount_in,
                     min_amount_out: U256::from(0u64),
                     recipient: buy_recipient,
                     deadline,
@@ -1617,7 +2714,7 @@ impl Bot {
                 let params = BuyV2EthParams {
                     router: candidate.router,
                     path: vec![wrapped_native, candidate.token],
-                    amount_in: candidate.implied_liquidity,
+                    amount_in,
                     min_amount_out: U256::from(0u64),
                     recipient: buy_recipient,
                     deadline,
@@ -1634,7 +2731,7 @@ impl Bot {
                 token_in: candidate.base,
                 token_out: candidate.token,
                 stable,
-                amount_in: candidate.implied_liquidity,
+                amount_in,
                 min_amount_out: U256::from(0u64),
                 recipient: buy_recipient,
                 deadline,
@@ -1648,7 +2745,7 @@ impl Bot {
             let params = BuyV2Params {
                 router: candidate.router,
                 path: vec![candidate.base, candidate.token],
-                amount_in: candidate.implied_liquidity,
+                amount_in,
                 min_amount_out: U256::from(0u64),
                 recipient: buy_recipient,
                 deadline,
@@ -1659,9 +2756,27 @@ impl Bot {
             };
             self.tx_builder.build_buy_v2(params, nonce)
         };
-        let hash = self.sender.send(tx.clone()).await?;
-        info!(%hash, "buy tx sent");
-        Ok(ExecutionOutcome::Sent { hash, tx })
+        let mut tx = tx;
+        if let Err(err) = self.apply_gas_limit(&mut tx).await {
+            warn!(?err, "gas estimate failed; using node default");
+        }
+        let hash = self.send_with_nonce_retry(&mut tx).await?;
+        info!(
+            %hash,
+            token = %candidate.token,
+            base = %candidate.base,
+            router = %candidate.router,
+            pair = ?candidate.pair,
+            stable = ?candidate.stable,
+            buy_amount_base = %amount_in,
+            recipient = %buy_recipient,
+            "buy tx sent"
+        );
+        Ok(ExecutionOutcome::Sent {
+            hash,
+            tx,
+            entry_base_amount: amount_in,
+        })
     }
 }
 
@@ -1676,10 +2791,107 @@ impl Bot {
             || self.cfg.strategy.max_hold_secs > 0
             || self.cfg.strategy.emergency_reserve_drop_bps > 0
             || self.cfg.strategy.emergency_sell_sim_failures > 0
+            || self.position_log_interval_ms > 0
     }
 
     fn price_checks_enabled(&self) -> bool {
         self.cfg.strategy.take_profit_bps > 0 || self.cfg.strategy.stop_loss_bps > 0
+    }
+
+    fn should_log_position(&mut self, position_hash: B256, now_ms: u64) -> bool {
+        if self.position_log_interval_ms == 0 {
+            return false;
+        }
+        let last = self
+            .position_log_last_ms
+            .get(&position_hash)
+            .copied()
+            .unwrap_or(0);
+        if now_ms.saturating_sub(last) < self.position_log_interval_ms {
+            return false;
+        }
+        self.position_log_last_ms.insert(position_hash, now_ms);
+        true
+    }
+
+    fn should_notify_position_snapshot(
+        &mut self,
+        position_hash: B256,
+        pnl_dir: Option<&'static str>,
+    ) -> bool {
+        let dir = match pnl_dir {
+            Some("up") => Some(true),
+            Some("down") => Some(false),
+            _ => None,
+        };
+        let Some(dir) = dir else {
+            return false;
+        };
+        let last = self.position_snapshot_last_dir.get(&position_hash).copied();
+        if last == Some(dir) {
+            return false;
+        }
+        self.position_snapshot_last_dir.insert(position_hash, dir);
+        true
+    }
+
+    fn log_position_snapshot(
+        &mut self,
+        position_hash: B256,
+        position: &Position,
+        current_price: Option<U256>,
+        now_ms: u64,
+    ) {
+        let entry_price = position.entry_price_base_per_token;
+        let tp_price = entry_price
+            .filter(|_| self.cfg.strategy.take_profit_bps > 0)
+            .map(|price| apply_bps(price, self.cfg.strategy.take_profit_bps, true));
+        let sl_price = entry_price
+            .filter(|_| self.cfg.strategy.stop_loss_bps > 0)
+            .map(|price| apply_bps(price, self.cfg.strategy.stop_loss_bps, false));
+        let (pnl_bps, pnl_dir) = match (entry_price, current_price) {
+            (Some(entry), Some(current)) if !entry.is_zero() => {
+                if current >= entry {
+                    (
+                        Some((current - entry) * U256::from(10_000u64) / entry),
+                        Some("up"),
+                    )
+                } else {
+                    (
+                        Some((entry - current) * U256::from(10_000u64) / entry),
+                        Some("down"),
+                    )
+                }
+            }
+            _ => (None, None),
+        };
+        let entry_cost = self.entry_cost(position);
+        let open_secs = now_ms.saturating_sub(position.opened_ms) / 1000;
+        info!(
+            token = %position.token,
+            base = %position.base,
+            pair = ?position.pair,
+            status = ?position.status,
+            entry_base_amount = %entry_cost,
+            entry_price = ?entry_price,
+            current_price = ?current_price,
+            tp_price = ?tp_price,
+            sl_price = ?sl_price,
+            pnl_bps = ?pnl_bps,
+            pnl_dir = ?pnl_dir,
+            open_secs,
+            "position status"
+        );
+        if self.should_notify_position_snapshot(position_hash, pnl_dir) {
+            self.notify_position_snapshot(
+                position,
+                entry_price,
+                current_price,
+                pnl_bps,
+                pnl_dir,
+                open_secs,
+            );
+        }
     }
 
     async fn poll_positions(&mut self) -> Result<()> {
@@ -1719,7 +2931,8 @@ impl Bot {
                     continue;
                 }
 
-                if price_checks
+                let log_snapshot = self.should_log_position(hash, now);
+                if (price_checks || log_snapshot)
                     && (position.entry_price_base_per_token.is_none()
                         || position.entry_token_amount.is_none())
                 {
@@ -1742,8 +2955,7 @@ impl Bot {
                         }
                     }
                 }
-
-                let current_price = if price_checks {
+                let current_price = if price_checks || log_snapshot {
                     match self.current_price_for_position(&position).await {
                         Ok(price) => price,
                         Err(err) => {
@@ -1761,6 +2973,10 @@ impl Bot {
                 } else {
                     None
                 };
+
+                if log_snapshot {
+                    self.log_position_snapshot(hash, &position, current_price, now);
+                }
 
                 if let Some(reason) = self.evaluate_exit_reason(&position, now, current_price) {
                     exit_requests.push((hash, reason, current_price));
@@ -1833,11 +3049,7 @@ impl Bot {
             }
         }
 
-        let ttl_ms = self
-            .cfg
-            .strategy
-            .exit_signal_ttl_secs
-            .saturating_mul(1_000);
+        let ttl_ms = self.cfg.strategy.exit_signal_ttl_secs.saturating_mul(1_000);
         if ttl_ms > 0 {
             let pruned = self.positions.prune_exit_signaled(now, ttl_ms);
             if pruned > 0 {
@@ -1939,7 +3151,7 @@ impl Bot {
         };
         let deadline = U256::from(now_ms() / 1000 + self.cfg.dex.deadline_secs as u64);
         let max_block_number = self.resolve_max_block_number().await?;
-        let nonce = self.nonce.next_nonce();
+        let nonce = self.next_send_nonce().await?;
         let pair = position.pair.unwrap_or(Address::ZERO);
 
         let tx = if position.base == Address::ZERO {
@@ -2016,7 +3228,26 @@ impl Bot {
             self.tx_builder.build_sell_v2(params, nonce)
         };
 
-        let hash = self.sender.send(tx.clone()).await?;
+        let mut tx = tx;
+        if let Err(err) = self.apply_gas_limit(&mut tx).await {
+            warn!(?err, "gas estimate failed; using node default");
+        }
+        let hash = self.send_with_nonce_retry(&mut tx).await?;
+        let entry_base_amount = self.entry_cost(&position);
+        let (pnl_base_est, pnl_bps_est, pnl_dir_est) =
+            if !entry_base_amount.is_zero() && !min_amount_out.is_zero() {
+                if min_amount_out >= entry_base_amount {
+                    let diff = min_amount_out - entry_base_amount;
+                    let bps = diff.saturating_mul(U256::from(10_000u64)) / entry_base_amount;
+                    (Some(diff), Some(bps), Some("up"))
+                } else {
+                    let diff = entry_base_amount - min_amount_out;
+                    let bps = diff.saturating_mul(U256::from(10_000u64)) / entry_base_amount;
+                    (Some(diff), Some(bps), Some("down"))
+                }
+            } else {
+                (None, None, None)
+            };
         let now = now_ms();
         self.positions.set_exit_tx_hash(position_hash, hash, now);
         self.persist_positions();
@@ -2027,6 +3258,11 @@ impl Bot {
                 sent_at_ms: now,
                 last_sent_ms: now,
                 tx: Some(tx),
+                entry_base_amount,
+                min_amount_out,
+                pnl_base_est,
+                pnl_bps_est,
+                pnl_dir_up: pnl_dir_est.map(|dir| dir == "up"),
             },
         );
         info!(
@@ -2034,15 +3270,29 @@ impl Bot {
             token = %position.token,
             base = %position.base,
             reason = ?reason,
+            entry_base_amount = %entry_base_amount,
+            exit_amount_in = %amount_in,
+            min_amount_out = %min_amount_out,
+            pnl_base_est = ?pnl_base_est,
+            pnl_bps_est = ?pnl_bps_est,
+            pnl_dir_est = ?pnl_dir_est,
+            entry_price = ?position.entry_price_base_per_token,
+            current_price = ?current_price,
             "exit tx sent"
+        );
+        self.notify_exit_sent(
+            &position,
+            hash,
+            amount_in,
+            min_amount_out,
+            pnl_base_est,
+            pnl_bps_est,
+            pnl_dir_est,
         );
         Ok(())
     }
 
-    async fn exit_amount_for_position(
-        &self,
-        position: &Position,
-    ) -> Result<Option<U256>> {
+    async fn exit_amount_for_position(&self, position: &Position) -> Result<Option<U256>> {
         let estimate = self.position_token_amount(position);
         if self.tx_builder.owner == Address::ZERO {
             return Ok(estimate);
@@ -2116,11 +3366,7 @@ impl Bot {
     }
 
     fn touch_exit_retry(&mut self, position_hash: B256, position: &Position) {
-        let ttl_ms = self
-            .cfg
-            .strategy
-            .exit_signal_ttl_secs
-            .saturating_mul(1_000);
+        let ttl_ms = self.cfg.strategy.exit_signal_ttl_secs.saturating_mul(1_000);
         if ttl_ms == 0 {
             return;
         }
@@ -2148,6 +3394,41 @@ impl Bot {
         Ok(balance)
     }
 
+    async fn fetch_token_decimals(&mut self, token: Address) -> Option<u8> {
+        if self.notifier.is_none() {
+            return None;
+        }
+        if let Some(decimals) = self.token_decimals_cache.get(&token).copied() {
+            return Some(decimals);
+        }
+        let call = IERC20::decimalsCall {};
+        let tx = TransactionRequest {
+            to: Some(TxKind::Call(token)),
+            input: TransactionInput::new(call.abi_encode().into()),
+            ..Default::default()
+        };
+        let data = match self.chain.http.call(tx).await {
+            Ok(data) => data,
+            Err(err) => {
+                warn!(?err, token = %token, "token decimals lookup failed");
+                return None;
+            }
+        };
+        let decimals = match IERC20::decimalsCall::abi_decode_returns(&data) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(?err, token = %token, "token decimals decode failed");
+                return None;
+            }
+        };
+        if decimals > 36 {
+            warn!(token = %token, decimals, "token decimals out of range");
+            return None;
+        }
+        self.token_decimals_cache.insert(token, decimals);
+        Some(decimals)
+    }
+
     async fn token_allowance(
         &self,
         token: Address,
@@ -2165,11 +3446,7 @@ impl Bot {
         Ok(allowance)
     }
 
-    async fn ensure_base_token_approval(
-        &self,
-        token: Address,
-        amount_in: U256,
-    ) -> Result<()> {
+    async fn ensure_base_token_approval(&self, token: Address, amount_in: U256) -> Result<()> {
         if self.auto_approve_mode == AutoApproveMode::Off {
             return Ok(());
         }
@@ -2202,11 +3479,8 @@ impl Bot {
         Ok(())
     }
 
-    async fn send_token_approve(
-        &self,
-        token: Address,
-        amount: U256,
-    ) -> Result<B256> {
+    async fn send_token_approve(&self, token: Address, amount: U256) -> Result<B256> {
+        let nonce = self.next_send_nonce().await?;
         let call = IERC20::approveCall {
             spender: self.tx_builder.contract,
             amount,
@@ -2215,43 +3489,63 @@ impl Bot {
             from: Some(self.tx_builder.owner),
             to: Some(TxKind::Call(token)),
             input: TransactionInput::new(call.abi_encode().into()),
-            nonce: Some(self.nonce.next_nonce()),
+            nonce: Some(nonce),
             chain_id: Some(self.tx_builder.chain_id),
             ..Default::default()
         };
         self.tx_builder.fees.apply(&mut tx);
-        self.sender.send(tx).await
+        self.send_with_nonce_retry(&mut tx).await
     }
 
     async fn record_position(
         &mut self,
         candidate_hash: B256,
+        candidate: Option<LiquidityCandidate>,
         entry_tx_hash: B256,
         entry_block: Option<u64>,
         now_ms: u64,
+        entry_base_amount: U256,
+        entry_gas_used: Option<u64>,
+        entry_gas_price: Option<u128>,
     ) -> Result<()> {
         if self.positions.get(candidate_hash).is_some() {
             return Ok(());
         }
-        let Some(candidate) = self.candidate_store.candidate_snapshot(candidate_hash) else {
-            return Ok(());
+        let candidate = match candidate {
+            Some(candidate) => candidate,
+            None => match self.candidate_store.candidate_snapshot(candidate_hash) {
+                Some(candidate) => candidate,
+                None => return Ok(()),
+            },
         };
-        let position =
-            self.build_position(candidate, entry_tx_hash, entry_block, now_ms)
-                .await?;
+        let position = self
+            .build_position(
+                candidate,
+                entry_tx_hash,
+                entry_block,
+                now_ms,
+                entry_base_amount,
+                entry_gas_used,
+                entry_gas_price,
+            )
+            .await?;
         if self.positions.insert(position.clone()) {
             self.persist_positions();
+            let entry_cost = self.entry_cost(&position);
             info!(
                 router = %position.router,
                 token = %position.token,
                 base = %position.base,
                 pair = ?position.pair,
+                entry_base_amount = %entry_cost,
                 entry_token_amount = ?position.entry_token_amount,
                 entry_price = ?position.entry_price_base_per_token,
                 add_liq_tx_hash = %position.add_liq_tx_hash,
                 entry_tx_hash = %position.entry_tx_hash,
                 "position opened"
             );
+            self.notify_entry_filled(&position);
+            self.notify_position_opened(&position);
             if self.price_checks_enabled()
                 && (position.entry_price_base_per_token.is_none()
                     || position.entry_token_amount.is_none())
@@ -2268,15 +3562,19 @@ impl Bot {
     }
 
     async fn build_position(
-        &self,
+        &mut self,
         candidate: LiquidityCandidate,
         entry_tx_hash: B256,
         entry_block: Option<u64>,
         now_ms: u64,
+        entry_base_amount: U256,
+        entry_gas_used: Option<u64>,
+        entry_gas_price: Option<u128>,
     ) -> Result<Position> {
         let pricing_base = self
             .resolve_pricing_base_token(candidate.base)
             .unwrap_or(candidate.base);
+        let token_decimals = self.fetch_token_decimals(candidate.token).await;
         let mut position = Position {
             add_liq_tx_hash: candidate.add_liq_tx_hash,
             entry_tx_hash,
@@ -2284,9 +3582,11 @@ impl Bot {
             token: candidate.token,
             base: candidate.base,
             pricing_base,
+            token_decimals,
             pair: candidate.pair,
             stable: candidate.stable,
-            entry_base_amount: candidate.implied_liquidity,
+            entry_base_amount,
+            entry_base_spent: None,
             entry_token_amount: None,
             entry_price_base_per_token: None,
             entry_base_reserve: None,
@@ -2298,10 +3598,32 @@ impl Bot {
             exit_tx_hash: None,
         };
 
+        if let Some(block) = entry_block {
+            if let Ok(Some((base_spent, token_received))) = self
+                .realized_entry_fill(&position, block, entry_gas_used, entry_gas_price)
+                .await
+            {
+                if !base_spent.is_zero() {
+                    position.entry_base_spent = Some(base_spent);
+                }
+                if !token_received.is_zero() {
+                    position.entry_token_amount = Some(token_received);
+                    let price = base_spent.saturating_mul(U256::from(PRICE_SCALE)) / token_received;
+                    if !price.is_zero() {
+                        position.entry_price_base_per_token = Some(price);
+                    }
+                }
+            }
+        }
+
         match self.entry_quote_for_position(&position).await {
             Ok(Some((token_amount, price))) => {
-                position.entry_token_amount = Some(token_amount);
-                position.entry_price_base_per_token = Some(price);
+                if position.entry_token_amount.is_none() {
+                    position.entry_token_amount = Some(token_amount);
+                }
+                if position.entry_price_base_per_token.is_none() {
+                    position.entry_price_base_per_token = Some(price);
+                }
             }
             Ok(None) => {}
             Err(err) => {
@@ -2316,8 +3638,9 @@ impl Bot {
             }
         }
 
-        if let Ok(Some((base_reserve, token_reserve))) =
-            self.reserves_for_position(&position, position.entry_block).await
+        if let Ok(Some((base_reserve, token_reserve))) = self
+            .reserves_for_position(&position, position.entry_block)
+            .await
         {
             if !base_reserve.is_zero() && !token_reserve.is_zero() {
                 position.entry_base_reserve = Some(base_reserve);
@@ -2328,10 +3651,7 @@ impl Bot {
         Ok(position)
     }
 
-    async fn entry_quote_for_position(
-        &self,
-        position: &Position,
-    ) -> Result<Option<(U256, U256)>> {
+    async fn entry_quote_for_position(&self, position: &Position) -> Result<Option<(U256, U256)>> {
         if position.pricing_base == Address::ZERO {
             return Ok(None);
         }
@@ -2448,19 +3768,13 @@ impl Bot {
             if token_amount.is_zero() {
                 return Ok(None);
             }
-            let price =
-                amount_out.saturating_mul(U256::from(PRICE_SCALE)) / token_amount;
+            let price = amount_out.saturating_mul(U256::from(PRICE_SCALE)) / token_amount;
             return Ok(Some(price));
         }
 
         if let Some(pair) = position.pair {
             match self
-                .spot_price_base_per_token(
-                    pair,
-                    position.pricing_base,
-                    position.token,
-                    None,
-                )
+                .spot_price_base_per_token(pair, position.pricing_base, position.token, None)
                 .await
             {
                 Ok(price) => return Ok(price),
@@ -2517,36 +3831,20 @@ impl Bot {
             Some(stable) => {
                 if let Some(amount) = self
                     .quote_solidly_swap_amount_out(
-                        router,
-                        token_in,
-                        token_out,
-                        stable,
-                        amount_in,
-                        block,
+                        router, token_in, token_out, stable, amount_in, block,
                     )
                     .await?
                 {
                     return Ok(Some(amount));
                 }
                 self.quote_solidly_amounts_out(
-                    router,
-                    token_in,
-                    token_out,
-                    stable,
-                    amount_in,
-                    block,
+                    router, token_in, token_out, stable, amount_in, block,
                 )
                 .await
             }
             None => {
                 if let Some(amount) = self
-                    .quote_v2_swap_amount_out(
-                        router,
-                        token_in,
-                        token_out,
-                        amount_in,
-                        block,
-                    )
+                    .quote_v2_swap_amount_out(router, token_in, token_out, amount_in, block)
                     .await?
                 {
                     return Ok(Some(amount));
@@ -2587,8 +3885,7 @@ impl Bot {
             ..Default::default()
         };
         let slots = self.override_slots(token_in);
-        let overrides =
-            simulation_overrides(token_in, SIMULATION_SENDER, router, amount_in, slots);
+        let overrides = simulation_overrides(token_in, SIMULATION_SENDER, router, amount_in, slots);
         let call = match block {
             Some(block_number) => self
                 .chain
@@ -2635,7 +3932,11 @@ impl Bot {
             ..Default::default()
         };
         let call = match block {
-            Some(block_number) => self.chain.http.call(tx).block(BlockId::number(block_number)),
+            Some(block_number) => self
+                .chain
+                .http
+                .call(tx)
+                .block(BlockId::number(block_number)),
             None => self.chain.http.call(tx),
         };
         let data = match call.await {
@@ -2683,8 +3984,7 @@ impl Bot {
             ..Default::default()
         };
         let slots = self.override_slots(token_in);
-        let overrides =
-            simulation_overrides(token_in, SIMULATION_SENDER, router, amount_in, slots);
+        let overrides = simulation_overrides(token_in, SIMULATION_SENDER, router, amount_in, slots);
         let call = match block {
             Some(block_number) => self
                 .chain
@@ -2701,14 +4001,14 @@ impl Bot {
                 return Ok(None);
             }
         };
-        let amounts =
-            match ISolidlyRouter::swapExactTokensForTokensCall::abi_decode_returns(&data) {
-                Ok(amounts) => amounts,
-                Err(err) => {
-                    debug!(?err, "solidly swap quote decode failed");
-                    return Ok(None);
-                }
-            };
+        let amounts = match ISolidlyRouter::swapExactTokensForTokensCall::abi_decode_returns(&data)
+        {
+            Ok(amounts) => amounts,
+            Err(err) => {
+                debug!(?err, "solidly swap quote decode failed");
+                return Ok(None);
+            }
+        };
         Ok(amounts.last().copied())
     }
 
@@ -2736,7 +4036,11 @@ impl Bot {
             ..Default::default()
         };
         let call = match block {
-            Some(block_number) => self.chain.http.call(tx).block(BlockId::number(block_number)),
+            Some(block_number) => self
+                .chain
+                .http
+                .call(tx)
+                .block(BlockId::number(block_number)),
             None => self.chain.http.call(tx),
         };
         let data = match call.await {
@@ -2866,9 +4170,7 @@ impl Bot {
         }
 
         let max_hold_ms = self.cfg.strategy.max_hold_secs.saturating_mul(1_000);
-        if max_hold_ms > 0
-            && now_ms.saturating_sub(position.opened_ms) >= max_hold_ms
-        {
+        if max_hold_ms > 0 && now_ms.saturating_sub(position.opened_ms) >= max_hold_ms {
             return Some(ExitReason::MaxHold);
         }
 
@@ -2891,8 +4193,7 @@ impl Bot {
             if let Some((base_reserve, token_reserve)) =
                 self.reserves_for_position(position, None).await?
             {
-                if (position.entry_base_reserve.is_none()
-                    || position.entry_token_reserve.is_none())
+                if (position.entry_base_reserve.is_none() || position.entry_token_reserve.is_none())
                     && !base_reserve.is_zero()
                     && !token_reserve.is_zero()
                 {
@@ -3035,6 +4336,28 @@ impl Bot {
             .or_insert(PendingLiquidity {
                 candidate,
                 enqueued_ms: now_ms,
+                buy_amount_unavailable_since_ms: None,
+            });
+    }
+
+    fn defer_pending_liquidity_for_unavailable(
+        &mut self,
+        candidate: LiquidityCandidate,
+        now_ms: u64,
+    ) {
+        let hash = candidate.add_liq_tx_hash;
+        self.pending_liquidity
+            .entry(hash)
+            .and_modify(|entry| {
+                entry.candidate = candidate.clone();
+                entry.enqueued_ms = now_ms;
+                entry.buy_amount_unavailable_since_ms =
+                    Some(entry.buy_amount_unavailable_since_ms.unwrap_or(now_ms));
+            })
+            .or_insert(PendingLiquidity {
+                candidate,
+                enqueued_ms: now_ms,
+                buy_amount_unavailable_since_ms: Some(now_ms),
             });
     }
 
@@ -3044,6 +4367,7 @@ impl Bot {
         }
         let now = now_ms();
         let timeout_ms = self.cfg.strategy.wait_for_mine_timeout_ms;
+        let buy_amount_unavailable_ttl_ms = self.cfg.strategy.buy_amount_unavailable_retry_ttl_ms;
         let entries: Vec<(B256, PendingLiquidity)> = self
             .pending_liquidity
             .iter()
@@ -3057,15 +4381,37 @@ impl Bot {
                 self.pending_liquidity.remove(&tx_hash);
                 continue;
             }
+            if buy_amount_unavailable_ttl_ms > 0 {
+                if let Some(since) = entry.buy_amount_unavailable_since_ms {
+                    if now.saturating_sub(since) > buy_amount_unavailable_ttl_ms {
+                        warn!(%tx_hash, "buy amount unavailable retry ttl expired");
+                        self.pending_liquidity.remove(&tx_hash);
+                        self.record_failure_metric("buy_amount_unavailable_ttl");
+                        self.notify_entry_failed(
+                            &entry.candidate,
+                            "buy amount unavailable retry ttl expired",
+                            DropKind::Transient,
+                        );
+                        self.candidate_store.drop_transient(
+                            tx_hash,
+                            "buy amount unavailable retry ttl expired",
+                            now,
+                        );
+                        continue;
+                    }
+                }
+            }
             if timeout_ms > 0 && now.saturating_sub(entry.enqueued_ms) > timeout_ms {
                 warn!(%tx_hash, "add liquidity receipt timeout");
                 self.pending_liquidity.remove(&tx_hash);
                 self.record_failure_metric("liquidity_timeout");
-                self.candidate_store.drop_transient(
-                    tx_hash,
+                self.notify_entry_failed(
+                    &entry.candidate,
                     "addLiquidity receipt timeout",
-                    now,
+                    DropKind::Transient,
                 );
+                self.candidate_store
+                    .drop_transient(tx_hash, "addLiquidity receipt timeout", now);
                 continue;
             }
 
@@ -3077,21 +4423,40 @@ impl Bot {
                         warn!(%tx_hash, "add liquidity reverted");
                         self.pending_liquidity.remove(&tx_hash);
                         self.record_failure_metric("liquidity_revert");
-                        self.candidate_store.drop_terminal(
-                            tx_hash,
+                        self.notify_entry_failed(
+                            &entry.candidate,
                             "addLiquidity reverted",
-                            now,
+                            DropKind::Terminal,
                         );
+                        self.candidate_store
+                            .drop_terminal(tx_hash, "addLiquidity reverted", now);
                         continue;
                     }
-                    if let Err(err) = self
-                        .handle_mined_liquidity(entry.candidate, mined_block)
-                        .await
-                    {
-                        warn!(?err, %tx_hash, "failed to process mined add liquidity");
-                        continue;
+                    let candidate = entry.candidate.clone();
+                    match self.handle_mined_liquidity(candidate, mined_block).await {
+                        Ok(ExecutionAttemptOutcome::Deferred(reason)) => {
+                            let candidate = self
+                                .candidate_store
+                                .candidate_snapshot(tx_hash)
+                                .unwrap_or(entry.candidate);
+                            match reason {
+                                DeferredReason::BuyAmountUnavailable => {
+                                    self.defer_pending_liquidity_for_unavailable(candidate, now);
+                                }
+                                DeferredReason::Transient => {
+                                    self.enqueue_pending_liquidity(candidate, now);
+                                }
+                            }
+                            continue;
+                        }
+                        Ok(_) => {
+                            self.pending_liquidity.remove(&tx_hash);
+                        }
+                        Err(err) => {
+                            warn!(?err, %tx_hash, "failed to process mined add liquidity");
+                            continue;
+                        }
                     }
-                    self.pending_liquidity.remove(&tx_hash);
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -3107,7 +4472,7 @@ impl Bot {
         &mut self,
         mut candidate: LiquidityCandidate,
         mined_block: Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<ExecutionAttemptOutcome> {
         if candidate.pair.is_none() {
             self.invalidate_pair_cache(&candidate);
             self.resolve_candidate_pair(&mut candidate).await?;
@@ -3115,7 +4480,7 @@ impl Bot {
         self.candidate_store
             .set_state(candidate.clone(), BotState::Qualifying, now_ms());
         let Some(risk_base) = self.resolve_risk_base(&candidate, now_ms()) else {
-            return Ok(());
+            return Ok(ExecutionAttemptOutcome::Skipped);
         };
         info!(
             token = %candidate.token,
@@ -3144,6 +4509,11 @@ impl Bot {
                 None => {
                     warn!("wrapped_native not configured; skipping native execution");
                     self.record_failure_metric("config");
+                    self.notify_entry_failed(
+                        candidate,
+                        "wrapped_native not configured",
+                        DropKind::Terminal,
+                    );
                     self.candidate_store.drop_terminal(
                         candidate.add_liq_tx_hash,
                         "wrapped_native not configured",
@@ -3164,7 +4534,7 @@ impl Bot {
         mined_block: Option<u64>,
         allow_unresolved_pair: bool,
         defer_transient: bool,
-    ) -> Result<()> {
+    ) -> Result<ExecutionAttemptOutcome> {
         let now = now_ms();
         let allow_unresolved_pair =
             allow_unresolved_pair || self.cfg.dex.allow_execution_without_pair;
@@ -3185,7 +4555,7 @@ impl Bot {
                         reason = %reason,
                         "launch gate unavailable; deferring candidate"
                     );
-                    return Ok(());
+                    return Ok(ExecutionAttemptOutcome::Deferred(DeferredReason::Transient));
                 }
                 warn!(
                     token = %candidate.token,
@@ -3198,6 +4568,7 @@ impl Bot {
                     "launch gate rejected candidate"
                 );
                 self.record_failure_metric("launch_gate");
+                self.notify_entry_failed(&candidate, &reason, kind);
                 match kind {
                     DropKind::Transient => {
                         self.candidate_store
@@ -3208,7 +4579,7 @@ impl Bot {
                             .drop_terminal(candidate.add_liq_tx_hash, reason, now);
                     }
                 }
-                return Ok(());
+                return Ok(ExecutionAttemptOutcome::Skipped);
             }
         }
         if candidate.pair.is_none() && !allow_unresolved_pair {
@@ -3219,7 +4590,7 @@ impl Bot {
                     router = %candidate.router,
                     "pair unresolved; deferring candidate"
                 );
-                return Ok(());
+                return Ok(ExecutionAttemptOutcome::Deferred(DeferredReason::Transient));
             }
             warn!(
                 token = %candidate.token,
@@ -3228,12 +4599,10 @@ impl Bot {
                 "pair unresolved; skipping execution"
             );
             self.record_failure_metric("pair_unresolved");
-            self.candidate_store.drop_transient(
-                candidate.add_liq_tx_hash,
-                "pair unresolved",
-                now,
-            );
-            return Ok(());
+            self.notify_entry_failed(&candidate, "pair unresolved", DropKind::Transient);
+            self.candidate_store
+                .drop_transient(candidate.add_liq_tx_hash, "pair unresolved", now);
+            return Ok(ExecutionAttemptOutcome::Skipped);
         }
         if candidate.pair.is_none() && allow_unresolved_pair {
             warn!(
@@ -3271,8 +4640,7 @@ impl Bot {
         };
         let decision = self.risk.assess(&ctx).await?;
         if !decision.pass {
-            self.counters.totals.risk_fail =
-                self.counters.totals.risk_fail.saturating_add(1);
+            self.counters.totals.risk_fail = self.counters.totals.risk_fail.saturating_add(1);
             warn!(score = decision.score, reasons = ?decision.reasons, "risk reject");
             self.record_failure_metric("risk");
             let reason = if decision.reasons.is_empty() {
@@ -3280,51 +4648,70 @@ impl Bot {
             } else {
                 format!("risk rejected: {}", decision.reasons.join("; "))
             };
+            self.notify_entry_failed(&candidate, &reason, DropKind::Terminal);
             self.candidate_store
                 .drop_terminal(candidate.add_liq_tx_hash, reason, now);
-            return Ok(());
+            return Ok(ExecutionAttemptOutcome::Skipped);
         }
-        self.counters.totals.risk_pass =
-            self.counters.totals.risk_pass.saturating_add(1);
+        self.counters.totals.risk_pass = self.counters.totals.risk_pass.saturating_add(1);
         self.candidate_store
             .set_state(candidate.clone(), BotState::Executing, now);
         let candidate_hash = candidate.add_liq_tx_hash;
+        let candidate_snapshot = candidate.clone();
         match self.execute_candidate(candidate).await? {
-            ExecutionOutcome::Sent { hash, tx } => {
+            ExecutionOutcome::Sent {
+                hash,
+                tx,
+                entry_base_amount,
+            } => {
                 self.candidate_store
                     .mark_executed(candidate_hash, hash, now);
-                self.counters.totals.executed =
-                    self.counters.totals.executed.saturating_add(1);
+                self.counters.totals.executed = self.counters.totals.executed.saturating_add(1);
                 self.record_execution_metric();
+                self.notify_entry_sent(&candidate_snapshot, hash, entry_base_amount);
                 self.pending_receipts.insert(
                     hash,
                     PendingReceipt {
                         candidate_hash,
+                        candidate: candidate_snapshot,
                         sent_at_ms: now,
                         last_sent_ms: now,
+                        entry_base_amount,
                         tx,
                     },
                 );
             }
             ExecutionOutcome::Skipped(reason, kind) => {
+                if kind == DropKind::Transient
+                    && reason == BUY_AMOUNT_UNAVAILABLE_REASON
+                    && self.wait_for_mine_enabled()
+                {
+                    info!(%reason, "execution deferred");
+                    return Ok(ExecutionAttemptOutcome::Deferred(
+                        DeferredReason::BuyAmountUnavailable,
+                    ));
+                }
                 if defer_transient && kind == DropKind::Transient {
                     info!(%reason, "execution deferred");
-                    return Ok(());
+                    return Ok(ExecutionAttemptOutcome::Deferred(DeferredReason::Transient));
                 }
                 self.record_failure_metric("execution_skipped");
+                self.notify_entry_failed(&candidate_snapshot, reason, kind);
                 match kind {
                     DropKind::Transient => {
-                        self.candidate_store.drop_transient(candidate_hash, reason, now);
+                        self.candidate_store
+                            .drop_transient(candidate_hash, reason, now);
                     }
                     DropKind::Terminal => {
-                        self.candidate_store.drop_terminal(candidate_hash, reason, now);
+                        self.candidate_store
+                            .drop_terminal(candidate_hash, reason, now);
                     }
                 }
-                return Ok(());
+                return Ok(ExecutionAttemptOutcome::Skipped);
             }
         }
 
-        Ok(())
+        Ok(ExecutionAttemptOutcome::Executed)
     }
 
     async fn poll_receipts(&mut self) -> Result<()> {
@@ -3349,6 +4736,11 @@ impl Bot {
             }
             if timeout_ms > 0 && now.saturating_sub(entry.sent_at_ms) > timeout_ms {
                 warn!(%tx_hash, "receipt retry window expired");
+                self.notify_entry_failed(
+                    &entry.candidate,
+                    "receipt retry window expired",
+                    DropKind::Transient,
+                );
                 self.remove_pending_candidate(entry.candidate_hash);
                 resolved_candidates.insert(entry.candidate_hash);
                 continue;
@@ -3363,9 +4755,13 @@ impl Bot {
                         if let Err(err) = self
                             .record_position(
                                 entry.candidate_hash,
+                                Some(entry.candidate.clone()),
                                 tx_hash,
                                 receipt.block_number,
                                 now,
+                                entry.entry_base_amount,
+                                Some(receipt.gas_used),
+                                Some(receipt.effective_gas_price.into()),
                             )
                             .await
                         {
@@ -3383,7 +4779,11 @@ impl Bot {
                             self.candidate_store
                                 .mark_execution_failed(entry.candidate_hash, now);
                             if let Err(err) = self
-                                .fallback_after_revert(entry.candidate_hash, now)
+                                .fallback_after_revert(
+                                    entry.candidate_hash,
+                                    now,
+                                    Some(entry.candidate.clone()),
+                                )
                                 .await
                             {
                                 warn!(?err, "fallback after execution revert failed");
@@ -3391,6 +4791,11 @@ impl Bot {
                             continue;
                         } else {
                             self.record_failure_metric("execution_revert");
+                            self.notify_entry_failed(
+                                &entry.candidate,
+                                "execution reverted",
+                                DropKind::Terminal,
+                            );
                             self.candidate_store.drop_terminal(
                                 entry.candidate_hash,
                                 "execution reverted",
@@ -3428,13 +4833,18 @@ impl Bot {
                                     new_hash,
                                     PendingReceipt {
                                         candidate_hash: entry.candidate_hash,
+                                        candidate: entry.candidate.clone(),
                                         sent_at_ms: entry.sent_at_ms,
                                         last_sent_ms: now,
+                                        entry_base_amount: entry.entry_base_amount,
                                         tx: bumped_tx,
                                     },
                                 );
-                                self.candidate_store
-                                    .mark_executed(entry.candidate_hash, new_hash, now_ms());
+                                self.candidate_store.mark_executed(
+                                    entry.candidate_hash,
+                                    new_hash,
+                                    now_ms(),
+                                );
                             }
                             Err(err) => {
                                 warn!(?err, %tx_hash, "gas bump failed");
@@ -3469,6 +4879,7 @@ impl Bot {
         let mut positions_changed = false;
 
         for (tx_hash, entry) in entries {
+            let position_snapshot = self.positions.get(entry.position_hash).cloned();
             if resolved_positions.contains(&entry.position_hash) {
                 continue;
             }
@@ -3489,11 +4900,51 @@ impl Bot {
                         info!(%tx_hash, block, "exit tx confirmed");
                         self.positions.remove(entry.position_hash);
                         self.sell_sim_failures.remove(&entry.position_hash);
+                        self.position_log_last_ms.remove(&entry.position_hash);
+                        self.position_snapshot_last_dir.remove(&entry.position_hash);
                         positions_changed = true;
+                        let mut pnl_summary = None;
+                        if let Some(position) = position_snapshot.as_ref() {
+                            if let Ok(Some(realized)) = self
+                                .realized_exit_pnl(
+                                    position,
+                                    block,
+                                    receipt.gas_used.into(),
+                                    receipt.effective_gas_price.into(),
+                                )
+                                .await
+                            {
+                                pnl_summary = Some(realized);
+                            }
+                        }
+                        if pnl_summary.is_none() {
+                            pnl_summary = self.estimate_exit_pnl(&entry);
+                        }
+                        if let (Some(position), Some(pnl)) =
+                            (position_snapshot.as_ref(), pnl_summary.as_ref())
+                        {
+                            let amount = pnl.net_pnl.unwrap_or(pnl.pnl);
+                            let up = pnl.net_up.unwrap_or(pnl.up);
+                            self.record_realized_pnl(position.base, amount, up);
+                        }
+                        self.notify_exit_result(
+                            position_snapshot.as_ref(),
+                            entry.position_hash,
+                            tx_hash,
+                            true,
+                            pnl_summary.as_ref(),
+                        );
                     } else {
                         warn!(%tx_hash, block, "exit tx reverted");
                         self.positions.clear_exit_tx_hash(entry.position_hash, now);
                         positions_changed = true;
+                        self.notify_exit_result(
+                            position_snapshot.as_ref(),
+                            entry.position_hash,
+                            tx_hash,
+                            false,
+                            None,
+                        );
                     }
                     self.remove_pending_exit(entry.position_hash);
                     resolved_positions.insert(entry.position_hash);
@@ -3531,6 +4982,11 @@ impl Bot {
                                         sent_at_ms: entry.sent_at_ms,
                                         last_sent_ms: now,
                                         tx: Some(bumped_tx),
+                                        entry_base_amount: entry.entry_base_amount,
+                                        min_amount_out: entry.min_amount_out,
+                                        pnl_base_est: entry.pnl_base_est,
+                                        pnl_bps_est: entry.pnl_bps_est,
+                                        pnl_dir_up: entry.pnl_dir_up,
                                     },
                                 );
                                 self.positions
@@ -3556,26 +5012,54 @@ impl Bot {
         Ok(())
     }
 
-    async fn fallback_after_revert(&mut self, candidate_hash: B256, now: u64) -> Result<()> {
-        let Some(candidate) = self.candidate_store.candidate_snapshot(candidate_hash) else {
-            return Ok(());
+    async fn fallback_after_revert(
+        &mut self,
+        candidate_hash: B256,
+        now: u64,
+        candidate: Option<LiquidityCandidate>,
+    ) -> Result<()> {
+        let candidate = match candidate {
+            Some(candidate) => candidate,
+            None => match self.candidate_store.candidate_snapshot(candidate_hash) {
+                Some(candidate) => candidate,
+                None => return Ok(()),
+            },
         };
-        match self.chain.http.get_transaction_receipt(candidate_hash).await {
+        match self
+            .chain
+            .http
+            .get_transaction_receipt(candidate_hash)
+            .await
+        {
             Ok(Some(receipt)) => {
                 if !receipt.inner.status() {
-                    self.candidate_store
-                        .drop_terminal(candidate_hash, "addLiquidity reverted", now);
+                    self.candidate_store.drop_terminal(
+                        candidate_hash,
+                        "addLiquidity reverted",
+                        now,
+                    );
                     self.record_failure_metric("liquidity_revert");
                     return Ok(());
                 }
-                self.handle_mined_liquidity(candidate, receipt.block_number)
+                let candidate_for_defer = candidate.clone();
+                let outcome = self
+                    .handle_mined_liquidity(candidate, receipt.block_number)
                     .await?;
+                if matches!(
+                    outcome,
+                    ExecutionAttemptOutcome::Deferred(DeferredReason::BuyAmountUnavailable)
+                ) {
+                    self.defer_pending_liquidity_for_unavailable(candidate_for_defer, now);
+                }
             }
             Ok(None) => {
                 self.enqueue_pending_liquidity(candidate, now);
             }
             Err(err) => {
-                warn!(?err, "add liquidity receipt fetch failed after execution revert");
+                warn!(
+                    ?err,
+                    "add liquidity receipt fetch failed after execution revert"
+                );
                 self.enqueue_pending_liquidity(candidate, now);
             }
         }
@@ -3646,6 +5130,18 @@ impl Bot {
         debug!(nonce, "nonce synced");
         Ok(())
     }
+
+    async fn sync_nonce_allow_decrease(&self) -> Result<()> {
+        if self.tx_builder.owner == Address::ZERO {
+            return Ok(());
+        }
+        let nonce = self
+            .nonce
+            .sync_allow_decrease(&self.chain.http, self.tx_builder.owner)
+            .await?;
+        debug!(nonce, "nonce synced (allow decrease)");
+        Ok(())
+    }
 }
 
 fn is_historical_state_unavailable(reason: &str) -> bool {
@@ -3664,6 +5160,93 @@ fn is_historical_state_unavailable(reason: &str) -> bool {
         "missing state",
     ];
     patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn is_nonce_too_low(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    let patterns = [
+        "nonce too low",
+        "nonce is too low",
+        "transaction nonce too low",
+        "nonce already used",
+        "nonce has already been used",
+    ];
+    patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn is_nonce_too_high(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    let patterns = [
+        "nonce too high",
+        "nonce is too high",
+        "nonce exceeds",
+        "nonce gap",
+    ];
+    patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn is_tx_already_known(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    let patterns = [
+        "already known",
+        "known transaction",
+        "already imported",
+        "already in mempool",
+    ];
+    patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn is_tx_underpriced(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    let patterns = [
+        "replacement transaction underpriced",
+        "replacement underpriced",
+        "transaction underpriced",
+        "gas price too low",
+        "fee too low",
+        "max fee per gas less than block base fee",
+    ];
+    patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn txpool_matches_request(
+    request: &TransactionRequest,
+    txpool_tx: &impl TransactionResponse,
+) -> bool {
+    let expected_to = request.to.as_ref().and_then(|kind| kind.to().copied());
+    if txpool_tx.to() != expected_to {
+        return false;
+    }
+    if let Some(nonce) = request.nonce {
+        if txpool_tx.nonce() != nonce {
+            return false;
+        }
+    }
+    let expected_value = request.value.unwrap_or_default();
+    if txpool_tx.value() != expected_value {
+        return false;
+    }
+    let expected_input = request.input.clone().into_input().unwrap_or_default();
+    if txpool_tx.input() != &expected_input {
+        return false;
+    }
+    if let Some(chain_id) = request.chain_id {
+        if txpool_tx.chain_id() != Some(chain_id) {
+            return false;
+        }
+    }
+    true
+}
+
+fn parse_txpool_nonce(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x") {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    trimmed
+        .parse::<u64>()
+        .ok()
+        .or_else(|| u64::from_str_radix(trimmed, 16).ok())
 }
 
 fn bump_tx_fees(tx: &mut TransactionRequest, bump_pct: u32) -> bool {
@@ -3705,6 +5288,26 @@ fn apply_bps(value: U256, bps: u32, increase: bool) -> U256 {
     value.saturating_mul(factor) / denom
 }
 
+fn u256_to_f64(value: U256) -> Option<f64> {
+    value.to_string().parse::<f64>().ok()
+}
+
+fn format_amount_with_decimals(value: U256, decimals: u8, precision: usize) -> Option<String> {
+    let raw = u256_to_f64(value)?;
+    let scaled = raw / 10f64.powi(decimals as i32);
+    Some(format!("{scaled:.precision$}"))
+}
+
+fn format_percent_from_bps(bps: U256, up: bool) -> String {
+    let value = u256_to_f64(bps).unwrap_or(0.0) / 100.0;
+    let sign = if up { "+" } else { "-" };
+    format!("{sign}{value:.2}%")
+}
+
+fn format_tx_link(hash: B256) -> String {
+    format!("{SONICSCAN_TX_BASE}{hash}")
+}
+
 fn simulation_overrides(
     token: Address,
     owner: Address,
@@ -3744,29 +5347,27 @@ fn double_mapping_slot(owner: Address, spender: Address, slot: u64) -> B256 {
 mod tests {
     use super::*;
     use crate::state::{ExitReason, Position, PositionStatus};
-    use alloy::primitives::{address, Bytes, Uint, B256, U256, U64};
+    use alloy::consensus::transaction::Recovered;
+    use alloy::consensus::{Receipt, ReceiptEnvelope, Signed, TxEnvelope, TxLegacy, TxType};
+    use alloy::primitives::{address, Address, Bytes, Signature, TxKind, Uint, B256, U256, U64};
     use alloy::providers::{Provider, ProviderBuilder};
+    use alloy::rpc::types::transaction::TransactionInput;
+    use alloy::rpc::types::Transaction;
     use alloy::rpc::types::TransactionReceipt;
     use alloy::rpc::types::TransactionRequest;
     use alloy::sol_types::SolCall;
     use alloy::transports::mock::Asserter;
     use sonic_chain::NodeClient;
     use sonic_core::config::{
-        AppConfig,
-        ChainConfig,
-        DexConfig,
-        ExecutorConfig,
-        MempoolConfig,
-        ObservabilityConfig,
-        RiskConfig,
-        StrategyConfig,
+        AppConfig, ChainConfig, DexConfig, ExecutorConfig, MempoolConfig, ObservabilityConfig,
+        RiskConfig, StrategyConfig,
     };
     use sonic_core::dedupe::DedupeCache;
-    use sonic_dex::abi::{IUniswapV2Pair, IUniswapV2Router02, ISolidlyRouter};
+    use sonic_core::utils::now_ms;
+    use sonic_dex::abi::{ISolidlyRouter, IUniswapV2Pair, IUniswapV2Router02};
     use sonic_executor::fees::{FeeStrategy, GasMode};
     use sonic_executor::nonce::NonceManager;
     use sonic_executor::sender::TxSender;
-    use sonic_core::utils::now_ms;
     use std::collections::{HashMap, HashSet};
 
     fn test_config(launch_gate: bool, gate_mode: &str) -> AppConfig {
@@ -3808,6 +5409,11 @@ mod tests {
                 sellability_amount_base: "0".to_string(),
                 max_tax_bps: 0,
                 erc20_call_timeout_ms: 0,
+                trading_control_check: false,
+                trading_control_fail_closed: false,
+                max_tx_min_supply_bps: 0,
+                max_wallet_min_supply_bps: 0,
+                max_cooldown_secs: 0,
                 sell_simulation_mode: "best_effort".to_string(),
                 sell_simulation_override_mode: "detect".to_string(),
                 token_override_slots: Vec::new(),
@@ -3817,11 +5423,14 @@ mod tests {
                 executor_contract: "0x0000000000000000000000000000000000000000".to_string(),
                 gas_mode: "eip1559".to_string(),
                 auto_approve_mode: "off".to_string(),
+                gas_limit_buffer_bps: 0,
                 max_fee_gwei: 0,
                 max_priority_gwei: 0,
                 bump_pct: 0,
                 bump_interval_ms: 0,
                 nonce_sync_interval_ms: 0,
+                nonce_retry_delay_ms: 0,
+                nonce_retry_max_retries: 0,
                 receipt_poll_interval_ms: 0,
                 receipt_timeout_ms: 0,
                 max_block_number_delta: 0,
@@ -3833,6 +5442,15 @@ mod tests {
                 exit_signal_ttl_secs: 3600,
                 emergency_reserve_drop_bps: 0,
                 emergency_sell_sim_failures: 0,
+                buy_amount_mode: "liquidity".to_string(),
+                buy_amount_fixed: "0".to_string(),
+                buy_amount_wallet_bps: 0,
+                buy_amount_min: "0".to_string(),
+                buy_amount_max: "0".to_string(),
+                buy_amount_max_liquidity_bps: 0,
+                buy_amount_unavailable_retry_ttl_ms: 0,
+                buy_amount_native_reserve: "0".to_string(),
+                position_log_interval_ms: 0,
                 position_store_path: None,
                 wait_for_mine: false,
                 same_block_attempt: false,
@@ -3847,6 +5465,8 @@ mod tests {
                 metrics_bind: "0.0.0.0:0".to_string(),
                 log_level: "info".to_string(),
                 log_format: "pretty".to_string(),
+                base_usd_price: None,
+                base_decimals: 18,
             },
         }
     }
@@ -3881,9 +5501,24 @@ mod tests {
                 },
             );
         }
+        let gas_limit_buffer_bps = cfg.executor.gas_limit_buffer_bps;
+        let base_usd_price = cfg.observability.base_usd_price;
+        let base_decimals = cfg.observability.base_decimals;
         Bot {
-            launch_gate_mode: LaunchGateMode::parse(&cfg.dex.launch_only_liquidity_gate_mode).unwrap(),
+            launch_gate_mode: LaunchGateMode::parse(&cfg.dex.launch_only_liquidity_gate_mode)
+                .unwrap(),
             auto_approve_mode: AutoApproveMode::parse(&cfg.executor.auto_approve_mode).unwrap(),
+            buy_amount_mode: BuyAmountMode::parse(&cfg.strategy.buy_amount_mode).unwrap(),
+            buy_amount_fixed: parse_u256_decimal(&cfg.strategy.buy_amount_fixed).unwrap(),
+            buy_amount_wallet_bps: cfg.strategy.buy_amount_wallet_bps,
+            buy_amount_min: parse_u256_decimal(&cfg.strategy.buy_amount_min).unwrap(),
+            buy_amount_max: parse_u256_decimal(&cfg.strategy.buy_amount_max).unwrap(),
+            buy_amount_max_liquidity_bps: cfg.strategy.buy_amount_max_liquidity_bps,
+            buy_amount_native_reserve: parse_u256_decimal(&cfg.strategy.buy_amount_native_reserve)
+                .unwrap(),
+            position_log_interval_ms: cfg.strategy.position_log_interval_ms,
+            position_log_last_ms: HashMap::new(),
+            position_snapshot_last_dir: HashMap::new(),
             cfg,
             chain,
             routers: HashSet::new(),
@@ -3897,10 +5532,12 @@ mod tests {
             pair_cache: PairMetadataCache::new(1, 0, 0, HashMap::new()),
             dedupe: DedupeCache::new(1, 0),
             metrics: None,
+            notifier: None,
             tx_builder,
             nonce: NonceManager::new(0),
             sender: TxSender::new(provider),
             min_base_amount: U256::ZERO,
+            gas_limit_buffer_bps,
             pending_liquidity: HashMap::new(),
             pending_receipts: HashMap::new(),
             pending_exits: HashMap::new(),
@@ -3911,7 +5548,13 @@ mod tests {
             candidate_store: CandidateStore::new(1, 0),
             positions: PositionStore::new(),
             position_store_path: None,
+            positions_dirty: false,
+            positions_flush_tx: None,
             token_override_slots,
+            base_usd_price,
+            base_decimals,
+            total_realized_pnl_base: HashMap::new(),
+            token_decimals_cache: HashMap::new(),
         }
     }
 
@@ -3929,6 +5572,32 @@ mod tests {
         }
     }
 
+    fn build_txpool_tx(to: Address, value: U256, input: Bytes, nonce: u64) -> Transaction {
+        let legacy = TxLegacy {
+            chain_id: Some(1),
+            nonce,
+            gas_price: 1,
+            gas_limit: 21_000,
+            to: TxKind::Call(to),
+            value,
+            input,
+        };
+        let signature = Signature::from_bytes_and_parity(&[0u8; 64], false);
+        let signed = Signed::new_unchecked(legacy, signature, B256::from([9u8; 32]));
+        let envelope = TxEnvelope::Legacy(signed);
+        let recovered = Recovered::new_unchecked(
+            envelope,
+            address!("0x1111111111111111111111111111111111111111"),
+        );
+        Transaction {
+            inner: recovered,
+            block_hash: None,
+            block_number: None,
+            transaction_index: None,
+            effective_gas_price: None,
+        }
+    }
+
     fn sample_position(entry_price: Option<U256>, opened_ms: u64) -> Position {
         Position {
             add_liq_tx_hash: B256::from([9u8; 32]),
@@ -3937,9 +5606,11 @@ mod tests {
             token: address!("0x3000000000000000000000000000000000000003"),
             base: address!("0x2000000000000000000000000000000000000002"),
             pricing_base: address!("0x2000000000000000000000000000000000000002"),
+            token_decimals: Some(18),
             pair: Some(address!("0x4000000000000000000000000000000000000004")),
             stable: None,
             entry_base_amount: U256::from(1_000u64),
+            entry_base_spent: None,
             entry_token_amount: Some(U256::from(10u64)),
             entry_price_base_per_token: entry_price,
             entry_base_reserve: None,
@@ -3950,6 +5621,36 @@ mod tests {
             status: PositionStatus::Open,
             exit_tx_hash: None,
         }
+    }
+
+    #[test]
+    fn txpool_matcher_requires_payload_match() {
+        let to = address!("0x9000000000000000000000000000000000000009");
+        let input = Bytes::from(vec![1u8, 2, 3, 4]);
+        let value = U256::from(42u64);
+        let nonce = 7u64;
+        let request = TransactionRequest {
+            to: Some(TxKind::Call(to)),
+            value: Some(value),
+            input: TransactionInput::new(input.clone()),
+            nonce: Some(nonce),
+            chain_id: Some(1),
+            ..Default::default()
+        };
+        let matching = build_txpool_tx(to, value, input.clone(), nonce);
+        let mismatch_input = build_txpool_tx(to, value, Bytes::from(vec![9u8]), nonce);
+        let mismatch_to = build_txpool_tx(
+            address!("0x8000000000000000000000000000000000000008"),
+            value,
+            input.clone(),
+            nonce,
+        );
+        let mismatch_value = build_txpool_tx(to, U256::from(7u64), input, nonce);
+
+        assert!(txpool_matches_request(&request, &matching));
+        assert!(!txpool_matches_request(&request, &mismatch_input));
+        assert!(!txpool_matches_request(&request, &mismatch_to));
+        assert!(!txpool_matches_request(&request, &mismatch_value));
     }
 
     #[test]
@@ -3970,10 +5671,7 @@ mod tests {
         let allowance_key = double_mapping_slot(owner, spender, slots.allowance_slot);
 
         assert_eq!(state_diff.get(&balance_key), Some(&B256::from(amount)));
-        assert_eq!(
-            state_diff.get(&allowance_key),
-            Some(&B256::from(U256::MAX))
-        );
+        assert_eq!(state_diff.get(&allowance_key), Some(&B256::from(U256::MAX)));
         assert_eq!(state_diff.len(), 2);
     }
 
@@ -3985,7 +5683,8 @@ mod tests {
 
         let cfg = test_config(true, "strict");
         let mut bot = build_bot(cfg, &asserter, Vec::new());
-        let candidate = candidate_with_pair(Some(address!("0x4000000000000000000000000000000000000004")));
+        let candidate =
+            candidate_with_pair(Some(address!("0x4000000000000000000000000000000000000004")));
 
         let decision = bot
             .launch_only_liquidity_gate(&candidate, candidate.base, None)
@@ -4013,7 +5712,8 @@ mod tests {
 
         let cfg = test_config(true, "strict");
         let mut bot = build_bot(cfg, &asserter, Vec::new());
-        let candidate = candidate_with_pair(Some(address!("0x4000000000000000000000000000000000000004")));
+        let candidate =
+            candidate_with_pair(Some(address!("0x4000000000000000000000000000000000000004")));
 
         let decision = bot
             .launch_only_liquidity_gate(&candidate, candidate.base, None)
@@ -4047,7 +5747,8 @@ mod tests {
 
         let cfg = test_config(true, "strict");
         let mut bot = build_bot(cfg, &asserter, Vec::new());
-        let candidate = candidate_with_pair(Some(address!("0x4000000000000000000000000000000000000004")));
+        let candidate =
+            candidate_with_pair(Some(address!("0x4000000000000000000000000000000000000004")));
 
         let decision = bot
             .launch_only_liquidity_gate(&candidate, candidate.base, None)
@@ -4101,7 +5802,8 @@ mod tests {
 
         let cfg = test_config(true, "best_effort");
         let mut bot = build_bot(cfg, &asserter, Vec::new());
-        let candidate = candidate_with_pair(Some(address!("0x4000000000000000000000000000000000000004")));
+        let candidate =
+            candidate_with_pair(Some(address!("0x4000000000000000000000000000000000000004")));
 
         let decision = bot
             .launch_only_liquidity_gate(&candidate, candidate.base, None)
@@ -4119,7 +5821,8 @@ mod tests {
 
         let cfg = test_config(true, "strict");
         let mut bot = build_bot(cfg, &asserter, Vec::new());
-        let candidate = candidate_with_pair(Some(address!("0x4000000000000000000000000000000000000004")));
+        let candidate =
+            candidate_with_pair(Some(address!("0x4000000000000000000000000000000000000004")));
 
         let decision = bot
             .launch_only_liquidity_gate(&candidate, candidate.base, None)
@@ -4135,6 +5838,59 @@ mod tests {
         assert!(asserter.read_q().is_empty());
     }
 
+    #[test]
+    fn buy_amount_wallet_pct_applies_min_and_reserve() {
+        let asserter = Asserter::new();
+        let mut cfg = test_config(false, "strict");
+        cfg.strategy.buy_amount_mode = "wallet_pct".to_string();
+        cfg.strategy.buy_amount_wallet_bps = 1000;
+        cfg.strategy.buy_amount_min = "100".to_string();
+        cfg.strategy.buy_amount_native_reserve = "50".to_string();
+        let bot = build_bot(cfg, &asserter, Vec::new());
+
+        let amount = bot
+            .apply_buy_amount_limits(Address::ZERO, U256::from(10_000u64), U256::from(1_000u64))
+            .unwrap();
+
+        assert_eq!(amount, U256::from(100u64));
+    }
+
+    #[test]
+    fn buy_amount_fixed_respects_liquidity_cap() {
+        let asserter = Asserter::new();
+        let mut cfg = test_config(false, "strict");
+        cfg.strategy.buy_amount_mode = "fixed".to_string();
+        cfg.strategy.buy_amount_fixed = "1000".to_string();
+        cfg.strategy.buy_amount_max_liquidity_bps = 1000;
+        let bot = build_bot(cfg, &asserter, Vec::new());
+
+        let amount = bot
+            .apply_buy_amount_limits(
+                address!("0x2000000000000000000000000000000000000002"),
+                U256::from(5_000u64),
+                U256::from(10_000u64),
+            )
+            .unwrap();
+
+        assert_eq!(amount, U256::from(500u64));
+    }
+
+    #[test]
+    fn buy_amount_fails_when_reserve_exhausts_balance() {
+        let asserter = Asserter::new();
+        let mut cfg = test_config(false, "strict");
+        cfg.strategy.buy_amount_mode = "wallet_pct".to_string();
+        cfg.strategy.buy_amount_wallet_bps = 10_000;
+        cfg.strategy.buy_amount_native_reserve = "100".to_string();
+        let bot = build_bot(cfg, &asserter, Vec::new());
+
+        let err = bot
+            .apply_buy_amount_limits(Address::ZERO, U256::from(1_000u64), U256::from(100u64))
+            .unwrap_err();
+
+        assert!(matches!(err, BuyAmountError::InsufficientFunds(_)));
+    }
+
     #[tokio::test]
     async fn poll_receipts_keeps_pending_when_missing() {
         let asserter = Asserter::new();
@@ -4145,8 +5901,10 @@ mod tests {
             tx_hash,
             PendingReceipt {
                 candidate_hash: B256::ZERO,
+                candidate: candidate_with_pair(None),
                 sent_at_ms: now_ms(),
                 last_sent_ms: now_ms(),
+                entry_base_amount: U256::ZERO,
                 tx: TransactionRequest::default(),
             },
         );
@@ -4170,8 +5928,10 @@ mod tests {
             tx_hash,
             PendingReceipt {
                 candidate_hash: B256::ZERO,
+                candidate: candidate_with_pair(None),
                 sent_at_ms: 0,
                 last_sent_ms: 0,
+                entry_base_amount: U256::ZERO,
                 tx: TransactionRequest::default(),
             },
         );
@@ -4182,18 +5942,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_receipts_records_position_with_snapshot_when_candidate_pruned() {
+        let asserter = Asserter::new();
+        let cfg = test_config(true, "strict");
+        let mut bot = build_bot(cfg, &asserter, Vec::new());
+        bot.candidate_store = CandidateStore::new(1, 1);
+
+        let candidate_hash = B256::from([9u8; 32]);
+        let tx_hash = B256::from([10u8; 32]);
+        let candidate = LiquidityCandidate {
+            token: address!("0x3000000000000000000000000000000000000003"),
+            base: Address::ZERO,
+            router: address!("0x1000000000000000000000000000000000000001"),
+            factory: None,
+            pair: None,
+            stable: None,
+            add_liq_tx_hash: candidate_hash,
+            first_seen_ms: 0,
+            implied_liquidity: U256::from(1000u64),
+        };
+
+        bot.candidate_store.track_detected(candidate.clone(), 0);
+        bot.candidate_store.prune(10);
+        assert!(bot
+            .candidate_store
+            .candidate_snapshot(candidate_hash)
+            .is_none());
+
+        bot.pending_receipts.insert(
+            tx_hash,
+            PendingReceipt {
+                candidate_hash,
+                candidate: candidate.clone(),
+                sent_at_ms: 0,
+                last_sent_ms: 0,
+                entry_base_amount: U256::from(1u64),
+                tx: TransactionRequest::default(),
+            },
+        );
+
+        let receipt = TransactionReceipt {
+            inner: ReceiptEnvelope::from_typed(
+                TxType::Legacy,
+                Receipt::<alloy::primitives::Log>::default(),
+            ),
+            transaction_hash: tx_hash,
+            transaction_index: Some(0),
+            block_hash: Some(B256::from([1u8; 32])),
+            block_number: Some(1),
+            gas_used: 0,
+            effective_gas_price: 0,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            contract_address: None,
+        };
+
+        let response = Some(receipt);
+        asserter.push_success(&response);
+
+        bot.poll_receipts().await.unwrap();
+        assert!(bot.pending_receipts.is_empty());
+        assert!(bot.positions.get(candidate_hash).is_some());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
     async fn poll_liquidity_receipts_keeps_pending_when_missing() {
         let asserter = Asserter::new();
         let cfg = test_config(true, "strict");
         let mut bot = build_bot(cfg, &asserter, Vec::new());
         let tx_hash = B256::from([3u8; 32]);
-        let candidate = candidate_with_pair(Some(address!("0x4000000000000000000000000000000000000004")));
-        bot.candidate_store.track_detected(candidate.clone(), now_ms());
+        let candidate =
+            candidate_with_pair(Some(address!("0x4000000000000000000000000000000000000004")));
+        bot.candidate_store
+            .track_detected(candidate.clone(), now_ms());
         bot.pending_liquidity.insert(
             tx_hash,
             PendingLiquidity {
                 candidate,
                 enqueued_ms: now_ms(),
+                buy_amount_unavailable_since_ms: None,
             },
         );
 
@@ -4212,13 +6042,39 @@ mod tests {
         cfg.strategy.wait_for_mine_timeout_ms = 1;
         let mut bot = build_bot(cfg, &asserter, Vec::new());
         let tx_hash = B256::from([4u8; 32]);
-        let candidate = candidate_with_pair(Some(address!("0x4000000000000000000000000000000000000004")));
+        let candidate =
+            candidate_with_pair(Some(address!("0x4000000000000000000000000000000000000004")));
         bot.candidate_store.track_detected(candidate.clone(), 0);
         bot.pending_liquidity.insert(
             tx_hash,
             PendingLiquidity {
                 candidate,
                 enqueued_ms: 0,
+                buy_amount_unavailable_since_ms: None,
+            },
+        );
+
+        bot.poll_liquidity_receipts().await.unwrap();
+        assert!(bot.pending_liquidity.is_empty());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn poll_liquidity_receipts_drops_after_buy_amount_unavailable_ttl() {
+        let asserter = Asserter::new();
+        let mut cfg = test_config(true, "strict");
+        cfg.strategy.buy_amount_unavailable_retry_ttl_ms = 1;
+        let mut bot = build_bot(cfg, &asserter, Vec::new());
+        let tx_hash = B256::from([5u8; 32]);
+        let candidate =
+            candidate_with_pair(Some(address!("0x5000000000000000000000000000000000000005")));
+        bot.candidate_store.track_detected(candidate.clone(), 0);
+        bot.pending_liquidity.insert(
+            tx_hash,
+            PendingLiquidity {
+                candidate,
+                enqueued_ms: now_ms(),
+                buy_amount_unavailable_since_ms: Some(0),
             },
         );
 
@@ -4231,7 +6087,7 @@ mod tests {
     async fn build_position_sets_entry_quote_from_router() {
         let asserter = Asserter::new();
         let cfg = test_config(true, "strict");
-        let bot = build_bot(cfg, &asserter, Vec::new());
+        let mut bot = build_bot(cfg, &asserter, Vec::new());
         let mut candidate = candidate_with_pair(None);
         candidate.implied_liquidity = U256::from(1_000u64);
 
@@ -4241,12 +6097,19 @@ mod tests {
         ));
 
         let position = bot
-            .build_position(candidate, B256::ZERO, Some(12), now_ms())
+            .build_position(
+                candidate,
+                B256::ZERO,
+                Some(12),
+                now_ms(),
+                U256::from(1_000u64),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(position.entry_token_amount, Some(U256::from(100u64)));
-        let expected_price =
-            U256::from(1_000u64) * U256::from(PRICE_SCALE) / U256::from(100u64);
+        let expected_price = U256::from(1_000u64) * U256::from(PRICE_SCALE) / U256::from(100u64);
         assert_eq!(position.entry_price_base_per_token, Some(expected_price));
         assert!(asserter.read_q().is_empty());
     }
@@ -4269,8 +6132,7 @@ mod tests {
             .await
             .unwrap()
             .expect("price");
-        let expected_price =
-            U256::from(150u64) * U256::from(PRICE_SCALE) / U256::from(100u64);
+        let expected_price = U256::from(150u64) * U256::from(PRICE_SCALE) / U256::from(100u64);
         assert_eq!(price, expected_price);
         assert!(asserter.read_q().is_empty());
     }
@@ -4294,8 +6156,7 @@ mod tests {
             .await
             .unwrap()
             .expect("price");
-        let expected_price =
-            U256::from(140u64) * U256::from(PRICE_SCALE) / U256::from(100u64);
+        let expected_price = U256::from(140u64) * U256::from(PRICE_SCALE) / U256::from(100u64);
         assert_eq!(price, expected_price);
         assert!(asserter.read_q().is_empty());
     }
@@ -4384,9 +6245,9 @@ mod tests {
         bot.positions.insert(position);
 
         let amount_in = U256::from(10u64);
-        asserter.push_success(&Bytes::from(
-            IERC20::balanceOfCall::abi_encode_returns(&amount_in),
-        ));
+        asserter.push_success(&Bytes::from(IERC20::balanceOfCall::abi_encode_returns(
+            &amount_in,
+        )));
         let amounts = vec![amount_in, U256::from(0u64)];
         asserter.push_success(&Bytes::from(
             IUniswapV2Router02::swapExactTokensForTokensCall::abi_encode_returns(&amounts),
@@ -4426,9 +6287,9 @@ mod tests {
         bot.tx_builder.owner = address!("0xaaaa00000000000000000000000000000000aaaa");
 
         let position = sample_position(Some(U256::from(1u64)), 0);
-        asserter.push_success(&Bytes::from(
-            IERC20::balanceOfCall::abi_encode_returns(&U256::from(5u64)),
-        ));
+        asserter.push_success(&Bytes::from(IERC20::balanceOfCall::abi_encode_returns(
+            &U256::from(5u64),
+        )));
 
         let amount = bot
             .exit_amount_for_position(&position)
@@ -4538,9 +6399,9 @@ mod tests {
         bot.tx_builder.contract = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
         let allowance = U256::from(1u64);
-        asserter.push_success(&Bytes::from(
-            IERC20::allowanceCall::abi_encode_returns(&allowance),
-        ));
+        asserter.push_success(&Bytes::from(IERC20::allowanceCall::abi_encode_returns(
+            &allowance,
+        )));
         asserter.push_success(&U64::from(50_000u64));
         asserter.push_success(&B256::from([1u8; 32]));
         asserter.push_success(&U64::from(50_000u64));
@@ -4565,9 +6426,9 @@ mod tests {
         bot.tx_builder.contract = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
         let allowance = U256::ZERO;
-        asserter.push_success(&Bytes::from(
-            IERC20::allowanceCall::abi_encode_returns(&allowance),
-        ));
+        asserter.push_success(&Bytes::from(IERC20::allowanceCall::abi_encode_returns(
+            &allowance,
+        )));
         asserter.push_success(&U64::from(50_000u64));
         asserter.push_success(&B256::from([3u8; 32]));
 
