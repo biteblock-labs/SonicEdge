@@ -14,7 +14,7 @@ impl LaunchGateMode {
         match normalized.as_str() {
             "strict" => Ok(Self::Strict),
             "best_effort" | "best-effort" | "besteffort" => Ok(Self::BestEffort),
-            _ => return Err(anyhow!("unsupported launch_only_liquidity_gate_mode: {raw}").into()),
+            _ => Err(anyhow!("unsupported launch_only_liquidity_gate_mode: {raw}").into()),
         }
     }
 }
@@ -33,7 +33,7 @@ impl AutoApproveMode {
             "off" => Ok(Self::Off),
             "exact" => Ok(Self::Exact),
             "max" => Ok(Self::Max),
-            _ => return Err(anyhow!("unsupported executor.auto_approve_mode: {raw}").into()),
+            _ => Err(anyhow!("unsupported executor.auto_approve_mode: {raw}").into()),
         }
     }
 }
@@ -52,7 +52,7 @@ impl BuyAmountMode {
             "liquidity" => Ok(Self::Liquidity),
             "fixed" => Ok(Self::Fixed),
             "wallet_pct" | "wallet-pct" | "walletpct" | "wallet" => Ok(Self::WalletPct),
-            _ => return Err(anyhow!("unsupported strategy.buy_amount_mode: {raw}").into()),
+            _ => Err(anyhow!("unsupported strategy.buy_amount_mode: {raw}").into()),
         }
     }
 }
@@ -69,7 +69,7 @@ impl SellSimulationMode {
         match normalized.as_str() {
             "strict" => Ok(Self::Strict),
             "best_effort" | "best-effort" | "besteffort" => Ok(Self::BestEffort),
-            _ => return Err(anyhow!("unsupported risk.sell_simulation_mode: {raw}").into()),
+            _ => Err(anyhow!("unsupported risk.sell_simulation_mode: {raw}").into()),
         }
     }
 }
@@ -86,9 +86,7 @@ impl SellSimulationOverrideMode {
         match normalized.as_str() {
             "detect" => Ok(Self::Detect),
             "skip_any" | "skip-any" | "skipany" => Ok(Self::SkipAny),
-            _ => {
-                return Err(anyhow!("unsupported risk.sell_simulation_override_mode: {raw}").into())
-            }
+            _ => Err(anyhow!("unsupported risk.sell_simulation_override_mode: {raw}").into()),
         }
     }
 }

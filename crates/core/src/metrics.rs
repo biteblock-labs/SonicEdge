@@ -26,6 +26,13 @@ impl Metrics {
     }
 }
 
+#[cfg(feature = "metrics")]
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(not(feature = "metrics"))]
 pub struct Metrics;
 
@@ -37,5 +44,12 @@ impl Metrics {
 
     pub fn gather(&self) -> String {
         String::new()
+    }
+}
+
+#[cfg(not(feature = "metrics"))]
+impl Default for Metrics {
+    fn default() -> Self {
+        Metrics
     }
 }

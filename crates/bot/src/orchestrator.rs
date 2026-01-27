@@ -78,6 +78,7 @@ impl TokenOverrideSlots {
     };
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ExecutionOutcome {
     Sent {
         hash: B256,
@@ -745,6 +746,7 @@ impl Bot {
         self.notify(msg);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn notify_exit_sent(
         &self,
         position: &Position,
@@ -1037,12 +1039,8 @@ impl Bot {
         format!("{scaled:.8} base/token")
     }
 
-    fn base_decimals_for(&self, base: Address) -> u8 {
-        if base == Address::ZERO || Some(base) == self.wrapped_native {
-            self.base_decimals
-        } else {
-            self.base_decimals
-        }
+    fn base_decimals_for(&self, _base: Address) -> u8 {
+        self.base_decimals
     }
 
     fn base_amount_to_units(&self, base: Address, amount: U256) -> Option<f64> {
@@ -2572,7 +2570,7 @@ impl Bot {
                     let already_known = is_tx_already_known(&reason);
                     let underpriced = is_tx_underpriced(&reason);
                     if !nonce_too_low && !nonce_too_high && !already_known && !underpriced {
-                        return Err(err.into());
+                        return Err(err);
                     }
                     if already_known && tx.nonce.is_some() {
                         if let Some(hash) = self.txpool_hash_for_request(tx).await {
@@ -2581,7 +2579,7 @@ impl Bot {
                         }
                     }
                     if attempts >= max_retries {
-                        return Err(err.into());
+                        return Err(err);
                     }
                     attempts = attempts.saturating_add(1);
                     warn!(
@@ -2606,7 +2604,7 @@ impl Bot {
                     let bump_pct = self.cfg.executor.bump_pct;
                     if bump_pct == 0 || !bump_tx_fees(tx, bump_pct) {
                         warn!(reason = %reason, "fee bump skipped: bump_pct=0 or missing fee fields");
-                        return Err(err.into());
+                        return Err(err);
                     }
                 }
             }
@@ -2662,7 +2660,7 @@ impl Bot {
             }
         };
 
-        let deadline = U256::from(now_ms() / 1000 + self.cfg.dex.deadline_secs as u64);
+        let deadline = U256::from(now_ms() / 1000 + self.cfg.dex.deadline_secs);
         let max_block_number = self.resolve_max_block_number().await?;
         if candidate.base != Address::ZERO {
             if let Err(err) = self
@@ -3149,7 +3147,7 @@ impl Bot {
             self.exit_min_amount_out(&position, amount_in, current_price)
                 .await?
         };
-        let deadline = U256::from(now_ms() / 1000 + self.cfg.dex.deadline_secs as u64);
+        let deadline = U256::from(now_ms() / 1000 + self.cfg.dex.deadline_secs);
         let max_block_number = self.resolve_max_block_number().await?;
         let nonce = self.next_send_nonce().await?;
         let pair = position.pair.unwrap_or(Address::ZERO);
@@ -3395,9 +3393,7 @@ impl Bot {
     }
 
     async fn fetch_token_decimals(&mut self, token: Address) -> Option<u8> {
-        if self.notifier.is_none() {
-            return None;
-        }
+        self.notifier.as_ref()?;
         if let Some(decimals) = self.token_decimals_cache.get(&token).copied() {
             return Some(decimals);
         }
@@ -3497,6 +3493,7 @@ impl Bot {
         self.send_with_nonce_retry(&mut tx).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record_position(
         &mut self,
         candidate_hash: B256,
@@ -3561,6 +3558,7 @@ impl Bot {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build_position(
         &mut self,
         candidate: LiquidityCandidate,
@@ -4761,7 +4759,7 @@ impl Bot {
                                 now,
                                 entry.entry_base_amount,
                                 Some(receipt.gas_used),
-                                Some(receipt.effective_gas_price.into()),
+                                Some(receipt.effective_gas_price),
                             )
                             .await
                         {
@@ -4910,7 +4908,7 @@ impl Bot {
                                     position,
                                     block,
                                     receipt.gas_used.into(),
-                                    receipt.effective_gas_price.into(),
+                                    receipt.effective_gas_price,
                                 )
                                 .await
                             {
@@ -6317,15 +6315,19 @@ mod tests {
 
     #[test]
     fn bump_tx_fees_increases_gas_fields() {
-        let mut tx = TransactionRequest::default();
-        tx.max_fee_per_gas = Some(1_000u128);
-        tx.max_priority_fee_per_gas = Some(100u128);
+        let mut tx = TransactionRequest {
+            max_fee_per_gas: Some(1_000u128),
+            max_priority_fee_per_gas: Some(100u128),
+            ..Default::default()
+        };
         assert!(bump_tx_fees(&mut tx, 10));
         assert_eq!(tx.max_fee_per_gas, Some(1_100u128));
         assert_eq!(tx.max_priority_fee_per_gas, Some(110u128));
 
-        let mut legacy = TransactionRequest::default();
-        legacy.gas_price = Some(1_000u128);
+        let mut legacy = TransactionRequest {
+            gas_price: Some(1_000u128),
+            ..Default::default()
+        };
         assert!(bump_tx_fees(&mut legacy, 20));
         assert_eq!(legacy.gas_price, Some(1_200u128));
     }

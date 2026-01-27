@@ -500,6 +500,12 @@ impl PositionStore {
     }
 }
 
+impl Default for PositionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

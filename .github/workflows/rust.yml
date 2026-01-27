@@ -2,7 +2,7 @@ name: Rust CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, feat/production-mainnet-setup]
   pull_request:
     branches: [main, master]
 

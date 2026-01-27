@@ -1327,7 +1327,7 @@ fn double_mapping_slot(owner: Address, spender: Address, slot: u64) -> B256 {
 }
 
 fn is_probable_fallback(value: U256, probe_value: Option<U256>) -> bool {
-    probe_value.map_or(false, |probe| probe == value)
+    probe_value == Some(value)
 }
 
 fn selector(signature: &str) -> [u8; 4] {
