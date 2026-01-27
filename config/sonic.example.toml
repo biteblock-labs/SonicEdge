@@ -20,6 +20,7 @@ router_factories = []
 factory_pair_code_hashes = []
 wrapped_native = "0x0000000000000000000000000000000000000000"
 base_tokens = ["0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000001"]
+verification_tokens = []
 pair_cache_capacity = 2048
 pair_cache_ttl_ms = 300000
 pair_cache_negative_ttl_ms = 15000

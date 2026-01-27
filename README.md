@@ -113,6 +113,7 @@ forge test
 - `dex.allow_execution_without_pair` lets you execute without a pair/reserve guard (unsafe; for ultra-aggressive snipes).
 - `dex.launch_only_liquidity_gate` filters out adds where the pair already had liquidity in the prior block.
 - `dex.launch_only_liquidity_gate_mode` (`strict`/`best_effort`) controls behavior when the gate can't be evaluated.
+- `dex.verification_tokens` (optional) provides tokens used only for router sellability verification; it does not affect which pairs are traded.
 - `strategy.position_store_path` persists open positions and exit signals across restarts.
 - `strategy.emergency_reserve_drop_bps` exits if pair reserves drop below the entry baseline by the given bps (0 disables).
 - `strategy.emergency_sell_sim_failures` exits after N consecutive sell simulation failures (0 disables).

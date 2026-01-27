@@ -62,6 +62,8 @@ pub struct DexConfig {
     pub wrapped_native: Option<String>,
     #[serde(default)]
     pub base_tokens: Vec<String>,
+    #[serde(default)]
+    pub verification_tokens: Vec<String>,
     #[serde(default = "default_pair_cache_capacity")]
     pub pair_cache_capacity: usize,
     #[serde(default = "default_pair_cache_ttl_ms")]
@@ -234,6 +236,13 @@ impl AppConfig {
         let routers = parse_address_list("dex.routers", &self.dex.routers)?;
         let factories = parse_address_list("dex.factories", &self.dex.factories)?;
         let _ = parse_address_list("dex.base_tokens", &self.dex.base_tokens)?;
+        let verification_tokens =
+            parse_address_list("dex.verification_tokens", &self.dex.verification_tokens)?;
+        for token in &verification_tokens {
+            if *token == Address::ZERO {
+                bail_config!("dex.verification_tokens must not include zero address");
+            }
+        }
 
         if let Some(raw) = self.dex.wrapped_native.as_deref() {
             ensure_non_empty("dex.wrapped_native", raw)?;
@@ -731,6 +740,7 @@ mod tests {
                 factory_pair_code_hashes: Vec::new(),
                 wrapped_native: None,
                 base_tokens: vec!["0x0000000000000000000000000000000000000003".to_string()],
+                verification_tokens: Vec::new(),
                 pair_cache_capacity: 1,
                 pair_cache_ttl_ms: 1,
                 pair_cache_negative_ttl_ms: 1,

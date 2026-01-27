@@ -125,6 +125,7 @@ pub struct Bot {
     factories: Vec<Address>,
     base_tokens: HashSet<Address>,
     base_token_list: Vec<Address>,
+    verification_token_list: Vec<Address>,
     wrapped_native: Option<Address>,
     risk: RiskEngine,
     pair_cache: PairMetadataCache,
@@ -363,6 +364,12 @@ impl Bot {
             .map(|s| parse_address(s))
             .collect::<Result<Vec<_>>>()?;
         let base_tokens = base_token_list.iter().copied().collect::<HashSet<_>>();
+        let verification_token_list = cfg
+            .dex
+            .verification_tokens
+            .iter()
+            .map(|s| parse_address(s))
+            .collect::<Result<Vec<_>>>()?;
         let wrapped_native = match cfg.dex.wrapped_native.as_deref() {
             Some(raw) => {
                 let parsed = parse_address(raw)?;
@@ -429,11 +436,16 @@ impl Bot {
             cfg.dex.pair_cache_negative_ttl_ms,
             pair_code_hashes,
         );
+        let verification_tokens = Self::collect_verification_tokens(
+            &verification_token_list,
+            &base_token_list,
+            wrapped_native,
+        );
         let router_meta = Self::verify_router_support(
             &chain.http,
             &routers,
             &router_factories,
-            &base_token_list,
+            &verification_tokens,
             wrapped_native,
         )
         .await;
@@ -525,6 +537,7 @@ impl Bot {
             factories,
             base_tokens,
             base_token_list,
+            verification_token_list,
             wrapped_native,
             risk,
             pair_cache,
@@ -1295,7 +1308,7 @@ impl Bot {
 
         if tokens.len() < 2 {
             warn!(
-                "router verification needs at least two non-zero base tokens; sellability disabled"
+                "router verification needs at least two non-zero verification tokens; sellability disabled"
             );
             for &router in routers {
                 meta.insert(
@@ -1439,8 +1452,25 @@ impl Bot {
     }
 
     fn router_verification_tokens(&self) -> Vec<Address> {
+        Self::collect_verification_tokens(
+            &self.verification_token_list,
+            &self.base_token_list,
+            self.wrapped_native,
+        )
+    }
+
+    fn collect_verification_tokens(
+        verification_tokens: &[Address],
+        base_tokens: &[Address],
+        wrapped_native: Option<Address>,
+    ) -> Vec<Address> {
+        let source_tokens = if verification_tokens.is_empty() {
+            base_tokens
+        } else {
+            verification_tokens
+        };
         let mut tokens = Vec::new();
-        for &token in &self.base_token_list {
+        for &token in source_tokens {
             if token == Address::ZERO {
                 continue;
             }
@@ -1449,7 +1479,7 @@ impl Bot {
             }
         }
         if tokens.len() < 2 {
-            if let Some(wrapped_native) = self.wrapped_native {
+            if let Some(wrapped_native) = wrapped_native {
                 if wrapped_native != Address::ZERO && !tokens.contains(&wrapped_native) {
                     tokens.push(wrapped_native);
                 }
@@ -1508,7 +1538,9 @@ impl Bot {
 
         let tokens = self.router_verification_tokens();
         if tokens.len() < 2 {
-            debug!("router sellability recheck skipped; need at least two non-zero base tokens");
+            debug!(
+                "router sellability recheck skipped; need at least two non-zero verification tokens"
+            );
             return Ok(());
         }
 
@@ -5392,6 +5424,7 @@ mod tests {
                 factory_pair_code_hashes: Vec::new(),
                 wrapped_native: None,
                 base_tokens: Vec::new(),
+                verification_tokens: Vec::new(),
                 pair_cache_capacity: 1,
                 pair_cache_ttl_ms: 0,
                 pair_cache_negative_ttl_ms: 0,
@@ -5530,6 +5563,7 @@ mod tests {
             factories,
             base_tokens: HashSet::new(),
             base_token_list: Vec::new(),
+            verification_token_list: Vec::new(),
             wrapped_native: None,
             risk,
             pair_cache: PairMetadataCache::new(1, 0, 0, HashMap::new()),
@@ -5559,6 +5593,25 @@ mod tests {
             total_realized_pnl_base: HashMap::new(),
             token_decimals_cache: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn router_verification_tokens_prefers_verification_list() {
+        let token_a = address!("0x1000000000000000000000000000000000000001");
+        let token_b = address!("0x2000000000000000000000000000000000000002");
+        let token_c = address!("0x3000000000000000000000000000000000000003");
+        let tokens =
+            Bot::collect_verification_tokens(&[token_a, token_b], &[Address::ZERO, token_c], None);
+        assert_eq!(tokens, vec![token_a, token_b]);
+    }
+
+    #[test]
+    fn router_verification_tokens_falls_back_to_base_and_adds_wrapped() {
+        let token_a = address!("0x1000000000000000000000000000000000000001");
+        let wrapped = address!("0x2000000000000000000000000000000000000002");
+        let tokens =
+            Bot::collect_verification_tokens(&[], &[Address::ZERO, token_a], Some(wrapped));
+        assert_eq!(tokens, vec![token_a, wrapped]);
     }
 
     fn candidate_with_pair(pair: Option<Address>) -> LiquidityCandidate {

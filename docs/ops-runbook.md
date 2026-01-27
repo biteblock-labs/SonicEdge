@@ -26,6 +26,7 @@ geth \
 ## Configuration
 - Start from `config/sonic.example.toml` (template) or `config/sonic.alchemy.toml` (mainnet-ready allowlists).
 - Set `dex.routers`, `dex.factories`, and `dex.base_tokens`.
+- Use `dex.verification_tokens` if you want router sellability verification without expanding the trading base tokens list.
 - Prefer `dex.router_factories` to pin each router to its factory and avoid mismatches.
 - Populate `dex.factory_pair_code_hashes` to enable CREATE2 pair derivation on `getPair` misses.
 - Set `dex.sellability_recheck_interval_ms` to periodically re-check disabled routers (0 disables).
