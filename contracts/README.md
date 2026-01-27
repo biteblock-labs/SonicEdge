@@ -13,6 +13,15 @@ solc --optimize --optimize-runs 200 --bin --bin-runtime --abi SonicSniperExecuto
 
 - The runtime bytecode (`*.bin-runtime`) is what `sniper deploy-contract` compares against on-chain code; copy it to `contracts/bytecode/SonicSniperExecutor.hex` if you want local match checks.
 - `sniper deploy-contract` prints a canonical ABI hash using `contracts/abi/SonicSniperExecutor.json`.
+- Foundry artifacts:
+  - `forge inspect SonicSniperExecutor abi --json > contracts/abi/SonicSniperExecutor.json`
+  - `forge inspect SonicSniperExecutor deployedBytecode > contracts/bytecode/SonicSniperExecutor.hex`
+
+## Tests (Foundry)
+
+```
+forge test
+```
 
 ## Deploy
 

@@ -37,12 +37,16 @@ Txpool poll | TxpoolBackfill  |----+             |
    - txpool enabled for `txpool_content`
    - HTTP RPC enabled for calls and receipts
 2. Copy and edit config:
-   - `config/sonic.example.toml`
-3. Run:
+   - `config/sonic.example.toml` (template)
+   - `config/sonic.alchemy.toml` (mainnet-ready DEX allowlists; update RPC + executor)
+3. Create a `.env` file (see `env.example`) and set `SNIPER_PK`.
+4. Run:
 
 ```
 just run
 ```
+
+`just run` uses `config/sonic.alchemy.toml` by default (see `justfile`).
 
 ## Pending Subscriptions
 
@@ -62,13 +66,28 @@ just run
 - Keep `SNIPER_PK` in a secure environment and avoid shell history leaks.
 - The CLI loads `.env` automatically; prefer an env file with `0600` permissions or a secrets manager (systemd `EnvironmentFile` works well).
 - Optional: set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` to enable Telegram alerts.
+- Telegram entry/exit notifications include SonicScan tx links for quick tracking.
 - Never store private keys in config files or logs.
 - The executor contract is `Ownable` and NOT upgradeable.
 - Approvals should be tight and reset to zero after use.
+- If you plan to trade fee-on-transfer tokens, set `useFeeOnTransfer` on the executor.
 
 ## Contract Verification
 
 - Run `sniper deploy-contract` to print the canonical ABI hash and compare the configured executor's on-chain bytecode against `contracts/bytecode/SonicSniperExecutor.hex` when present.
+- ABI and bytecode artifacts can be regenerated with Foundry (`forge inspect ...`).
+
+## Contract Tests (Foundry)
+
+```
+forge test
+```
+
+## Production Service (systemd + logrotate)
+
+- Systemd unit: `scripts/systemd/sonicedge.service`
+- Logrotate config: `scripts/logrotate/sonicedge`
+- Build the release binary first: `cargo build --release -p sniper`
 
 ## Testing (Anvil)
 

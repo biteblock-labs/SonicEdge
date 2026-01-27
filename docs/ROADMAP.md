@@ -11,6 +11,7 @@ Developer roadmap with checklist items aligned to the original scope.
 - [x] UniswapV2 router/factory/pair ABI JSONs
 - [x] Unit test: decode V2 addLiquidity
 - [x] Unit test: encode executor buyV2
+- [x] Foundry executor test suite (buy/sell paths + guards)
 
 ## Phase 1: Mempool Ingestion (V1)
 - [x] WS pending tx hash subscription (`newPendingTransactions`)
@@ -81,11 +82,13 @@ Developer roadmap with checklist items aligned to the original scope.
 - [x] Prometheus counters/gauges (ingestion queue depth/drops, dedup hits)
 - [x] Prometheus counters/gauges (candidates, exec, failures)
 - [x] Structured JSON logs option
+- [x] Telegram tx links for entry/exit confirmations
 
 ## Phase 7: Hardening & Ops
 - [x] Key management guide (env, HSM, file perms)
 - [x] Config validation on startup (required fields + bounds)
 - [x] CLI command: `sniper deploy-contract` verify address + ABI hash
+- [x] Systemd + logrotate templates for production runs
 - [ ] Replay harness with richer sample dataset
 - [x] Decide and document full-pipeline verification approach (anvil fork) with acceptance criteria
 - [ ] Integration tests with local sonic devnet

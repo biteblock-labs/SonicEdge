@@ -24,7 +24,7 @@ geth \
 ```
 
 ## Configuration
-- Start from `config/sonic.example.toml`.
+- Start from `config/sonic.example.toml` (template) or `config/sonic.alchemy.toml` (mainnet-ready allowlists).
 - Set `dex.routers`, `dex.factories`, and `dex.base_tokens`.
 - Prefer `dex.router_factories` to pin each router to its factory and avoid mismatches.
 - Populate `dex.factory_pair_code_hashes` to enable CREATE2 pair derivation on `getPair` misses.
@@ -42,6 +42,7 @@ geth \
 - Set `strategy.position_log_interval_ms` to emit periodic position snapshots (entry/current price, TP/SL bands, PnL direction).
 - Set `strategy.buy_amount_unavailable_retry_ttl_ms` to cap retries after balance RPC errors (0 disables).
 - Set `observability.log_format` to `json` for structured logs (`pretty` default).
+- Bind `observability.metrics_bind` to an internal interface only (for example `127.0.0.1:9102`) or disable metrics.
 - Set `dex.wrapped_native` (wS on Sonic) and include `0x0000000000000000000000000000000000000000` in `dex.base_tokens` to enable native-base execution.
 - Some Solidly routers (e.g. SwapX RouterV2) do not expose `WETH()/weth()` getters; verify the wrapped base token via docs or transfer traces (wS on Sonic mainnet).
 - Set `executor.executor_contract` to your deployed address.
@@ -51,6 +52,8 @@ geth \
 - Set `risk.sell_simulation_mode` (`strict`/`best_effort`) and `risk.sell_simulation_override_mode` (`detect`/`skip_any`) to tune sell simulation enforcement.
 - Set `risk.trading_control_check = true` to reject tokens with paused/disabled trading or future start-time gates; `risk.trading_control_fail_closed = true` makes start-time failures fatal (default false).
 - Set `risk.max_tx_min_supply_bps`, `risk.max_wallet_min_supply_bps`, and `risk.max_cooldown_secs` to enforce maxTx/maxWallet/cooldown thresholds (0 disables each).
+- Raise `risk.max_tax_bps` if you intend to trade fee-on-transfer tokens with higher taxes.
+- For illiquid launches, consider loosening the limits (lower `max_tx_min_supply_bps`/`max_wallet_min_supply_bps`, higher `max_cooldown_secs`, or `trading_control_fail_closed = false`).
 - Use `risk.token_override_slots` to define non-standard ERC20 storage layouts (balance/allowance slots) so sell simulation and quote overrides work on tokens like USDC.
 
 ## Secrets
@@ -69,8 +72,16 @@ TELEGRAM_CHAT_ID=<chat_id>
 
 - The CLI loads `.env` automatically. Prefer `0600` permissions (or a secrets manager) and reference it from systemd; never store private keys in config files or logs.
 
+## Foundry Tests (Contracts)
+```
+forge test
+```
+
 ## Deploy Contract
 - Compile and deploy `contracts/SonicSniperExecutor.sol` from your hot wallet.
+- To refresh artifacts from Foundry:
+  - `forge inspect SonicSniperExecutor abi --json > contracts/abi/SonicSniperExecutor.json`
+  - `forge inspect SonicSniperExecutor deployedBytecode > contracts/bytecode/SonicSniperExecutor.hex`
 - Approve the executor to spend base token for the owner wallet.
 - Optional: set `executor.auto_approve_mode = "max"` (or `"exact"`) to let the bot send base-token approvals on demand (the bot will reset allowance to 0 first when a nonzero allowance exists).
 - Buys send tokens to the executor contract; no extra approval is needed to sell those positions.
@@ -127,6 +138,13 @@ TOKEN=0xC9a43158891282A2B1475592D5719c001986Aaec scripts/submit_liquidity_eth.sh
 ```
 just run
 ```
+`just run` uses `config/sonic.alchemy.toml` by default (see `justfile`).
+
+## Production Service (systemd + logrotate)
+- Systemd unit template: `scripts/systemd/sonicedge.service`
+- Logrotate config: `scripts/logrotate/sonicedge`
+- Build the release binary before enabling the service:
+  - `cargo build --release -p sniper`
 
 ## Health Checks
 - Verify WS subscriptions are live (logs show pending hashes and new heads).
@@ -138,6 +156,7 @@ just run
 - Tail logs for decode/risk/execute decisions.
 - If metrics enabled, scrape the Prometheus endpoint from `observability.metrics_bind`.
 - Metrics include queue depth, drop counts, and dedup hits for mempool ingestion.
+- Telegram notifications include SonicScan tx links for entry/exit confirmations (when enabled).
 
 ## Common Issues
 - **No pending txs:** check WS endpoint, node WS config, or firewall.

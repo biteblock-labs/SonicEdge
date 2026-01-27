@@ -63,7 +63,7 @@ Txpool backfill   |------> | V2 Decoder   |
 - `contracts/SonicSniperExecutor.sol`
   - Ownable, minimal storage.
   - `buyV2` for atomic swaps with reserve and block guards.
-  - Optional fee-on-transfer swap path.
+  - Optional fee-on-transfer swap path (toggle via `setUseFeeOnTransfer`).
   - Rescue methods for tokens and ETH.
 
 ## Execution Strategy (V1)
@@ -87,6 +87,10 @@ Txpool backfill   |------> | V2 Decoder   |
   - `eth_getTransactionReceipt`
 - Txpool backfill:
   - `txpool_content` polling to catch missed hashes.
+
+## Notifications & Observability
+- Telegram notifications can be enabled with env vars; entry/exit messages include SonicScan tx links.
+- Prometheus metrics can be exposed on a configurable bind address.
 
 ## Failure Modes and Guards
 - Missed pending txs: txpool backfill + dedupe window.
